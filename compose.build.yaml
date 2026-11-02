@@ -1,0 +1,4 @@
+# Optional local build. The default Compose file uses the image from GHCR.
+services:
+  mb-local:
+    build: .

@@ -8,7 +8,8 @@ A small self-hosted control panel built on the protocol code from
 ```sh
 cp .env.example .env
 # Edit .env and set APP_PASSWORD to your own local app password.
-docker compose up --build -d
+docker compose pull
+docker compose up -d
 ```
 
 Open **http://localhost:8080**, sign in with `APP_PASSWORD`, then enter your Mercedes
@@ -25,6 +26,57 @@ PUBLIC_ORIGIN=http://192.168.1.20:8080
 Replace the address with your server's LAN address. When using an HTTPS reverse proxy,
 set `PUBLIC_ORIGIN` to its HTTPS URL, preserve the Host header, and proxy to port 8080.
 Use HTTPS on untrusted networks; passwords and PINs pass through the browser connection.
+
+### Images and updates
+
+Every push to `main` builds and publishes
+`ghcr.io/davilag/mb-controller` for **linux/amd64** and **linux/arm64**.
+Pull requests build the amd64 image without publishing it. The workflow uses
+GitHub's built-in `GITHUB_TOKEN`; no personal registry token is needed in CI.
+
+Published tags are `latest`, `sha-<full commit SHA>` and `sha-<short commit SHA>`.
+For reproducible deployments, set `MB_CONTROLLER_IMAGE` in `.env` to a commit
+tag or image digest rather than `latest`. To update a running installation:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+If the GHCR package is private, authenticate before pulling:
+`docker login ghcr.io -u YOUR_GITHUB_USER` using a token with `read:packages`.
+For anonymous pulls, the package owner must make the GHCR package public.
+
+To build locally instead of using the published image:
+
+```sh
+docker compose -f compose.yaml -f compose.build.yaml up --build -d
+```
+
+### Runtime dependencies
+
+Compose needs **only the `mb-local` container**. There is no separate database,
+Redis, MQTT broker, or Home Assistant dependency. Python, its pinned libraries
+(`aiohttp`, `protobuf`, `cryptography` and transitive dependencies), timezone
+data, and the compiled React frontend are bundled in the image. Node/npm is
+only used while building the frontend, not at runtime.
+
+Provide:
+
+- `APP_PASSWORD`: a strong password for this web app, supplied through `.env`.
+- `PUBLIC_ORIGIN`: the URL used by your browser, including its port. This is
+  also checked against incoming requests; it must match your LAN/proxy URL.
+- `TZ`: the charging-schedule timezone, default `Europe/London`.
+- Persistent volume `mb-data` mounted at `/app/data` for encrypted account
+  tokens, their encryption key, and schedule configuration. Keep it across
+  container updates; `docker compose down -v` deletes this stored state.
+- Outbound DNS and HTTPS/WebSocket connectivity to Mercedes cloud services.
+- An inbound mapping to container port `8080` (loopback-only by default).
+
+Use one backend instance per data volume. Mercedes account credentials and
+the vehicle PIN are entered in the web UI, not added to Compose. An HTTPS
+reverse proxy is optional for trusted local-only access and recommended for
+access across untrusted networks. The image includes an `/api/health` check.
 
 ## POC features
 
