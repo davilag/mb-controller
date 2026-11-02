@@ -1,0 +1,246 @@
+"""Define an object to interact with the REST API."""
+
+from __future__ import annotations
+
+from ..runtime import HomeAssistant, async_get_clientsession
+
+import json
+import logging
+import traceback
+import uuid
+
+from aiohttp import ClientSession
+from aiohttp.client_exceptions import ClientError
+import google.protobuf.message
+
+from server.mbapi.app_version import AppVersionManager
+
+from .const import REGION_CHINA, RIS_OS_VERSION, SYSTEM_PROXY, VERIFY_SSL, WEBSOCKET_USER_AGENT, WEBSOCKET_USER_AGENT_CN
+from .helper import UrlHelper as helper
+from .oauth import Oauth
+from .proto import vehicle_events_pb2
+
+LOGGER = logging.getLogger(__name__)
+
+
+class WebApi:
+    """Define the API object."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        oauth: Oauth,
+        session: ClientSession,
+        region: str,
+        app_version: AppVersionManager,
+    ) -> None:
+        """Initialize."""
+        self._session: ClientSession = session
+        self._oauth: Oauth = oauth
+        self._region = region
+        self._app_version = app_version
+        self.hass = hass
+        self.session_id = str(uuid.uuid4()).upper()
+
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        rcp_headers: bool = False,
+        ignore_errors: bool = False,
+        return_as_json: bool = True,
+        **kwargs,
+    ):
+        """Make a request against the API."""
+
+        url = f"{helper.Rest_url(self._region)}{endpoint}"
+        kwargs.setdefault("headers", {})
+        kwargs.setdefault("proxy", SYSTEM_PROXY)
+
+        token = await self._oauth.async_get_cached_token()
+
+        if not self._session or self._session.closed:
+            self._session = async_get_clientsession(self.hass, VERIFY_SSL)
+
+        if not rcp_headers:
+            await self._app_version.async_refresh(self._session)
+            kwargs["headers"] = {
+                "Authorization": f"Bearer {token['access_token']}",
+                "X-SessionId": self.session_id,
+                "X-TrackingId": str(uuid.uuid4()).upper(),
+                "ris-os-name": "ios",
+                "ris-os-version": RIS_OS_VERSION,
+                "X-Locale": "de-DE",
+                "Content-Type": "application/json; charset=UTF-8",
+            }
+            self._app_version.apply_webapi_headers(kwargs["headers"])
+        else:
+            kwargs["headers"] = {
+                "Authorization": f"Bearer {token['access_token']}",
+                "User-Agent": WEBSOCKET_USER_AGENT,
+                "Accept-Language": "de-DE;q=1.0, en-DE;q=0.9",
+            }
+
+        try:
+            if "url" in kwargs:
+                async with self._session.request(method, **kwargs) as resp:
+                    # resp.raise_for_status()
+                    if return_as_json:
+                        return await resp.json(content_type=None)
+
+                    return await resp.read()
+            else:
+                async with self._session.request(method, url, **kwargs) as resp:
+                    if 400 <= resp.status < 500:
+                        try:
+                            error = await resp.text()
+                            error_json = json.loads(error)
+                            if error_json:
+                                error_message = f"Error requesting: {url} - {resp.status} -  {error_json['code']} - {error_json['errors']}"
+                            else:
+                                error_message = f"Error requesting: {url} - {resp.status} - 0 - {error}"
+                        except (json.JSONDecodeError, KeyError):
+                            error_message = f"Error requesting: {url} - {resp.status} - 0 - {error}"
+
+                        LOGGER.error(error_message) if not ignore_errors else LOGGER.info(error_message)
+                    else:
+                        resp.raise_for_status()
+
+                    if return_as_json:
+                        return await resp.json(content_type=None)
+
+                    return await resp.read()
+
+        except ClientError as err:
+            LOGGER.debug(traceback.format_exc())
+            if not ignore_errors:
+                raise ClientError from err
+
+            return []
+        except Exception:  # noqa: BLE001 - deliberate catch-all: this parses arbitrary
+            # API responses, so an unexpected TypeError/KeyError from a
+            # malformed payload degrades to a None return rather than tearing
+            # down setup. Kept broad for that reason.
+            LOGGER.debug(traceback.format_exc())
+
+    async def get_config(self):
+        """Get standard user information."""
+        return await self._request("get", "/v1/config")
+
+    async def get_user(self):
+        """Get standard user information."""
+        return await self._request("get", "/v1/user")
+
+    async def get_user_info(self):
+        """Get all devices associated with an API key."""
+        return await self._request("get", "/v2/vehicles")
+
+    async def get_car_capabilities(self, vin: str):
+        """Get all car capabilities associated with an vin."""
+        return await self._request("get", f"/v1/vehicle/{vin}/capabilities")
+
+    async def get_car_capabilities_commands(self, vin: str):
+        """Get all car capabilities associated with an vin."""
+        return await self._request("get", f"/v1/vehicle/{vin}/capabilities/commands")
+
+    async def get_car_rcp_supported_settings(self, vin: str):
+        """Get all supported car rcp options associated."""
+        url = f"{helper.RCP_url(self._region)}/api/v1/vehicles/{vin}/settings"
+
+        LOGGER.debug("get_car_rcp_supported_settings: %s", url)
+        return await self._request("get", "", url=url, rcp_headers=True)
+
+    async def get_car_rcp_settings(self, vin: str, setting: str):
+        """Get all rcp setting for a car."""
+        url = f"{helper.RCP_url(self._region)}/api/v1/vehicles/{vin}/settings/{setting}"
+
+        LOGGER.debug("get_car_rcp_settings: %s", url)
+        return await self._request("get", "", url=url, rcp_headers=True)
+
+    async def send_route_to_car(
+        self,
+        vin: str,
+        title: str,
+        latitude: float,
+        longitude: float,
+        city: str,
+        postcode: str,
+        street: str,
+    ):
+        """Send route to car associated by vin."""
+        data = {
+            "routeTitle": title,
+            "routeType": "singlePOI",
+            "waypoints": [
+                {
+                    "city": city,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "postalCode": postcode,
+                    "street": street,
+                    "title": title,
+                }
+            ],
+        }
+
+        return await self._request("post", f"/v1/vehicle/{vin}/route", data=json.dumps(data))
+
+    async def get_car_geofencing_violations(self, vin: str):
+        """Get all geofencing violations for a car."""
+        url = f"/v1/geofencing/vehicles/{vin}/fences/violations"
+        return await self._request("get", url, rcp_headers=False, ignore_errors=True)
+
+    async def get_fleet_info(self, company: str, fleet: str):
+        """Get fleet information."""
+        url = f"/v1/company/{company}/fleet/{fleet}?size=100&filter="
+        return await self._request("get", url, rcp_headers=False, ignore_errors=True)
+
+    async def is_car_rcp_supported(self, vin: str, **kwargs):
+        """Return if is car rcp supported."""
+        token = await self._oauth.async_get_cached_token()
+        headers = {
+            "Authorization": f"Bearer {token['access_token']}",
+            "User-Agent": WEBSOCKET_USER_AGENT if self._region != REGION_CHINA else WEBSOCKET_USER_AGENT_CN,
+        }
+
+        kwargs.setdefault("headers", headers)
+        kwargs.setdefault("proxy", SYSTEM_PROXY)
+
+        url = f"{helper.PSAG_url(self._region)}/api/app/v2/vehicles/{vin}/profileInformation"
+
+        if not self._session or self._session.closed:
+            self._session = async_get_clientsession(self.hass, VERIFY_SSL)
+
+        async with self._session.request("get", url, **kwargs) as resp:
+            resp_status = resp.status
+            await resp.text()
+            return bool(resp_status == 200)
+
+    async def download_images(self, vin: str):
+        """Download the car images and store it to the components ressource folder."""
+        url = f"/v1/vehicle/{vin}/topviewimage"
+        return await self._request("get", url, rcp_headers=False, ignore_errors=False, return_as_json=False)
+
+    async def get_car_p2b_data_via_rest(self, vin: str):
+        """Get vehicleattributes via rest.
+
+        The widget endpoint answers with a VehicleStatusUpdate - one car, the
+        typed VSU attribute shape - not the legacy VEPUpdate. Parsing it as
+        VEPUpdate still succeeds, because protobuf tolerates fields it does not
+        know, but every single attribute ends up in unknown-field storage and
+        MessageToJson() then returns "{}".
+        """
+        url = f"{helper.Widget_url(self._region)}/v1/vehicle/{vin}/vehicleattributes"
+
+        message = None
+        try:
+            data = await self._request("get", "", url=url, return_as_json=False)
+            message = vehicle_events_pb2.VehicleStatusUpdate()
+            message.ParseFromString(data)
+        except TypeError as err:
+            LOGGER.error("could not decode the vehicleattributes response: %s", err)
+            return None
+        except google.protobuf.message.DecodeError as err:
+            LOGGER.error("could not decode the vehicleattributes response: %s", err)
+            return None
+        return message or None
