@@ -46,8 +46,6 @@ function ChargeLimitControl({ car, connected, busy, scheduled, onConfirm }: { ca
 }
 
 function App() {
-  const [session, setSession] = useState<boolean | null>(null);
-  const [passwordRequired, setPasswordRequired] = useState(false);
   const [state, setState] = useState<State>(emptyState);
   const [vin, setVin] = useState('');
   const [busy, setBusy] = useState(false);
@@ -61,13 +59,6 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    api<{ authenticated: boolean; passwordRequired: boolean }>('/session').then(data => { if (active) { setSession(data.authenticated); setPasswordRequired(data.passwordRequired); } }).catch(e => { if (active) setError(e.message); });
-    return () => { active = false; };
-  }, []);
-
-  useEffect(() => {
-    if (!session) return;
-    let active = true;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
@@ -78,7 +69,7 @@ function App() {
     }
     void poll();
     return () => { active = false; clearTimeout(timer); };
-  }, [session]);
+  }, []);
 
   useEffect(() => {
     if (selectedCommand) dialog.current?.showModal();
@@ -139,11 +130,8 @@ function App() {
       <div className="intro"><p className="eyebrow">YOUR GARAGE</p><h1>Your Mercedes.<br /><span>Your local server.</span></h1><p>A direct connection to your car, with controls in your browser.</p></div>
       {error ? <div className="message error" role="alert">{error}</div> : null}
       {notice ? <div className="message" role="status">{notice}</div> : null}
-      {session === null ? <p role="status">Connecting to local backend…</p> : !session ? <section className="panel narrow"><h2>Unlock MB Local</h2><p>Enter the app password configured on your server.</p><form onSubmit={event => {
-        event.preventDefault(); const form = event.currentTarget; const password = new FormData(form).get('password');
-        void run(async () => { await api('/session', { method: 'POST', body: JSON.stringify({ password }) }); setSession(true); });
-      }}><label>Local app password<input name="password" type="password" required autoComplete="current-password" /></label><button className="primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button></form></section> : <>
-        <div className="toolbar"><span className={`connection ${state.connected ? 'online' : ''}`}><i />{state.connected ? 'Mercedes connection live' : state.configured ? 'Connecting to Mercedes…' : 'Account not connected'}</span><div className="toolbar-actions">{state.configured ? <button disabled={busy} onClick={() => setShowConnect(value => !value)}>{showConnect ? 'Close account form' : 'Reconnect account'}</button> : null}{passwordRequired ? <button disabled={busy} onClick={() => { void run(async () => { await api('/session', { method: 'DELETE' }); setSession(false); setState(emptyState); }); }}>Sign out</button> : null}</div></div>
+      <>
+        <div className="toolbar"><span className={`connection ${state.connected ? 'online' : ''}`}><i />{state.connected ? 'Mercedes connection live' : state.configured ? 'Connecting to Mercedes…' : 'Account not connected'}</span><div className="toolbar-actions">{state.configured ? <button disabled={busy} onClick={() => setShowConnect(value => !value)}>{showConnect ? 'Close account form' : 'Reconnect account'}</button> : null}</div></div>
         {state.error ? <div className="message error" role="alert">{state.error}</div> : null}
         {!state.configured || showConnect ? <section className="panel connect"><div><p className="eyebrow">01 / CONNECT</p><h2>Connect your account</h2><p>Use the account linked to your vehicle in the Mercedes-Benz app.</p><p className="small">This unofficial integration uses Mercedes cloud services. Sign in to the official app first. Accounts requiring MFA are not supported by this login flow.</p><a className="text-link" href="https://github.com/ReneNulschDE/mbapi2020" target="_blank" rel="noreferrer">Based on mbapi2020 ↗</a></div><form onSubmit={connect}>
           <label>Mercedes email<input name="email" type="email" autoComplete="username" required disabled={busy} placeholder="you@example.com" /></label>
@@ -162,7 +150,7 @@ function App() {
           <details className="panel"><summary>Vehicle data <span className="small">{Object.keys(car.attributes).length} attributes</span></summary><label className="filter">Filter attributes<input type="search" value={filter} onChange={e => setFilter(e.target.value)} placeholder="Battery, tyre pressure, location…" /></label><div className="data-table"><table><thead><tr><th>Attribute</th><th>Reported value</th><th>Status</th></tr></thead><tbody>{Object.entries(car.attributes).filter(([key]) => key.toLowerCase().includes(filter.toLowerCase())).map(([key, attribute]) => <tr key={key}><th scope="row">{key}</th><td>{display(attribute)}</td><td>{attribute.status}</td></tr>)}</tbody></table></div>{!Object.keys(car.attributes).length ? <p>Waiting for your first vehicle update.</p> : null}</details>
           <div className="bottom-actions"><p className="small">Latest message: {car.updatedAt ? new Date(car.updatedAt).toLocaleString() : 'Waiting for vehicle telemetry'}. Vehicle data can be delayed.</p><button disabled={busy} onClick={() => { if (window.confirm('Disconnect this account and delete its saved tokens?')) void run(async () => { const data = await api<State>('/account', { method: 'DELETE' }); setState(data); setVin(''); setNotice('Account disconnected. Saved tokens deleted.'); }); }}>Disconnect account</button></div>
         </> : null}
-      </>}
+      </>
     </main>
     <footer><span>MB Local / v0.1</span><span>Independent project · Not affiliated with Mercedes-Benz</span></footer>
     <dialog ref={dialog} onCancel={() => { setSelectedCommand(null); setPin(''); }} onClose={() => { setSelectedCommand(null); setPin(''); }}><form onSubmit={sendCommand}><p className="eyebrow">CONFIRM REMOTE ACTION</p><h2>{selectedCommand?.label}</h2><p>{selectedCommand?.id === 'charge_limit' ? <>Set the charge limit to <strong>{selectedCommand.maxSoc}%</strong> for <strong>{car?.plate}</strong>?</> : <>Send this command to <strong>{car?.plate}</strong>?</>}</p>{selectedCommand?.requiresPin ? <label>Vehicle security PIN<input value={pin} onChange={e => setPin(e.target.value.replace(/\D/g, '').slice(0, 4))} type="password" inputMode="numeric" pattern="[0-9]{4}" minLength={4} maxLength={4} required autoComplete="off" /></label> : null}<div className="dialog-actions"><button type="button" onClick={() => { setSelectedCommand(null); setPin(''); }}>Cancel</button><button className="primary" type="submit" disabled={busy}>Send command</button></div></form></dialog>

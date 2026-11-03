@@ -12,7 +12,8 @@ docker compose pull
 docker compose up -d
 ```
 
-Open **http://localhost:8080**, sign in with `APP_PASSWORD`, then enter your Mercedes
+Open **http://localhost:8080**, use the browser's HTTP Basic authentication prompt
+(username `admin`, password `APP_PASSWORD`), then enter your Mercedes
 email/password and choose **Europe** for UK accounts. Credentials go to your local backend;
 the backend connects to Mercedes cloud services. This does not make the car connection offline/local.
 
@@ -64,6 +65,8 @@ only used while building the frontend, not at runtime.
 Provide:
 
 - `APP_PASSWORD`: a strong password for this web app, supplied through `.env`.
+- `APP_USERNAME`: HTTP Basic authentication username (default `admin`). The browser
+  prompts before loading the app; the health endpoint remains public for Docker.
 - `PUBLIC_ORIGIN`: the URL used by your browser, including its port. This is
   also checked against incoming requests; it must match your LAN/proxy URL.
 - `TZ`: the charging-schedule timezone, default `Europe/London`.
@@ -92,7 +95,8 @@ access across untrusted networks. The image includes an `/api/health` check.
 - Explicit confirmation for commands; unlock asks for the four-digit vehicle security PIN.
 - Command submission is reported as **sent**, never as vehicle completion. Last reported
   command state/errors appear separately and may refer to another command until an update arrives.
-- Disconnect deletes saved account tokens. Signing out only ends your browser session.
+- Disconnect deletes saved account tokens. HTTP Basic credentials are cached by your
+  browser; close its session or use a private window to avoid sharing access.
 
 ## Daily charge-limit schedule
 
@@ -172,7 +176,7 @@ npm run build
 ```
 
 The local server binds to `127.0.0.1:8080` by default. Optional: set `APP_PASSWORD` for
-the local app login. A non-loopback backend binding requires it. For frontend hot reload,
+HTTP Basic authentication (username `admin`, or `APP_USERNAME`). A non-loopback backend binding requires it. For frontend hot reload,
 run `npm run dev` in another terminal; Vite forwards `/api` to the backend.
 
 ```sh

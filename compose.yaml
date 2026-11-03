@@ -6,6 +6,7 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
     environment:
       APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in .env first}
+      APP_USERNAME: ${APP_USERNAME:-admin}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8080}
       TZ: ${TZ:-Europe/London}
     volumes:

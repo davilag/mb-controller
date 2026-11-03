@@ -7,11 +7,10 @@ import hmac
 import logging
 import os
 from pathlib import Path
-import secrets
 import time
 from urllib.parse import urlsplit
 
-from aiohttp import web
+from aiohttp import BasicAuth, web
 
 from .bridge import Bridge, BridgeError
 from .schedule import ChargeScheduler
@@ -23,28 +22,46 @@ def create_app(*, data_dir=None, password=None):
     app_password = os.environ.get("APP_PASSWORD", "") if password is None else password
     public_origin = os.environ.get("PUBLIC_ORIGIN", "http://localhost:8080").rstrip("/")
     allowed_hosts = {"localhost", "127.0.0.1", "::1", urlsplit(public_origin).hostname}
-    sessions = {}
+    app_username = os.environ.get("APP_USERNAME", "admin")
     attempts = defaultdict(deque)
     bridge = Bridge(Path(data_dir or os.environ.get("DATA_DIR", ROOT / "data")))
     scheduler = ChargeScheduler(bridge, timezone_name=os.environ.get("TZ", "Europe/London"))
 
     def authenticated(request):
-        expiry = sessions.get(request.cookies.get("mb_session", ""), 0)
-        return not app_password or expiry > time.time()
+        if not app_password:
+            return True
+        try:
+            credentials = BasicAuth.decode(request.headers.get("Authorization", ""))
+        except ValueError:
+            return False
+        return (hmac.compare_digest(credentials.login.encode(), app_username.encode())
+                & hmac.compare_digest(credentials.password.encode(), app_password.encode()))
 
     @web.middleware
     async def guard(request, handler):
         host = urlsplit("//" + request.host).hostname
         if host not in allowed_hosts:
             return web.json_response({"error": "Host not allowed. Set PUBLIC_ORIGIN to your server URL."}, status=403)
+        if request.path != "/api/health" and not authenticated(request):
+            # Count supplied invalid credentials, not the initial browser challenge.
+            if request.headers.get("Authorization"):
+                history = attempts[(request.remote, "local-login")]
+                now = time.monotonic()
+                while history and history[0] < now - 300:
+                    history.popleft()
+                if len(history) >= 10:
+                    return web.json_response({"error": "Too many login attempts."}, status=429,
+                                             headers={"Retry-After": "300", "Cache-Control": "no-store"})
+                history.append(now)
+            return web.json_response({"error": "Authentication required."}, status=401,
+                                     headers={"WWW-Authenticate": 'Basic realm="MB Local", charset="UTF-8"',
+                                              "Cache-Control": "no-store"})
         if request.path.startswith("/api/"):
             if request.method not in ("GET", "HEAD", "OPTIONS"):
                 origin = request.headers.get("Origin")
                 same_origin = f"{request.scheme}://{request.host}"
                 if origin and origin not in {same_origin, public_origin}:
                     return web.json_response({"error": "Cross-origin request rejected."}, status=403)
-            if request.path not in ("/api/health", "/api/session") and not authenticated(request):
-                return web.json_response({"error": "Sign in to MB Local first."}, status=401)
         try:
             response = await handler(request)
         except BridgeError as error:
@@ -69,9 +86,6 @@ def create_app(*, data_dir=None, password=None):
     async def health(request):
         return web.json_response({"ok": True})
 
-    async def session_status(request):
-        return web.json_response({"authenticated": authenticated(request), "passwordRequired": bool(app_password)})
-
     def rate_limit(request, group, limit, period):
         key = (request.remote, group)
         history = attempts[key]
@@ -81,27 +95,6 @@ def create_app(*, data_dir=None, password=None):
         if len(history) >= limit:
             raise BridgeError("Too many attempts. Wait a few minutes and try again.")
         history.append(now)
-
-    async def session_login(request):
-        rate_limit(request, "local-login", 10, 300)
-        data = await request.json()
-        candidate = data.get("password", "")
-        if not isinstance(candidate, str) or not hmac.compare_digest(candidate.encode(), app_password.encode()):
-            return web.json_response({"error": "Incorrect local app password."}, status=401)
-        now = time.time()
-        for old in [key for key, expiry in sessions.items() if expiry < now]:
-            sessions.pop(old)
-        token = secrets.token_urlsafe(32)
-        sessions[token] = now + 12 * 3600
-        response = web.json_response({"authenticated": True})
-        response.set_cookie("mb_session", token, max_age=12 * 3600, httponly=True, samesite="Strict", secure=public_origin.startswith("https://"))
-        return response
-
-    async def session_logout(request):
-        sessions.pop(request.cookies.get("mb_session", ""), None)
-        response = web.json_response({"ok": True})
-        response.del_cookie("mb_session")
-        return response
 
     async def state(request):
         return web.json_response({**bridge.state(), "schedule": scheduler.snapshot()})
@@ -168,9 +161,6 @@ def create_app(*, data_dir=None, password=None):
 
     app.cleanup_ctx.append(lifecycle)
     app.router.add_get("/api/health", health)
-    app.router.add_get("/api/session", session_status)
-    app.router.add_post("/api/session", session_login)
-    app.router.add_delete("/api/session", session_logout)
     app.router.add_get("/api/state", state)
     app.router.add_get("/api/schedule", get_schedule)
     app.router.add_put("/api/schedule", save_schedule)

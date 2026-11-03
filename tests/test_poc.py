@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiohttp import BasicAuth
 from aiohttp.test_utils import TestClient, TestServer
 import pytest
 import pytest_asyncio
@@ -28,11 +29,12 @@ async def http(tmp_path):
 async def test_http_authentication_origin_and_validation(http):
     assert (await http.get("/api/health")).status == 200
     assert (await http.get("/api/state")).status == 401
-    assert (await http.post("/api/session", json={"password": "bad"})).status == 401
-    result = await http.post("/api/session", json={"password": "local-test-password"})
-    assert result.status == 200
-    assert "HttpOnly" in result.headers["Set-Cookie"]
-    assert "SameSite=Strict" in result.headers["Set-Cookie"]
+    challenge = await http.get("/")
+    assert challenge.status == 401
+    assert challenge.headers["WWW-Authenticate"].startswith('Basic realm="MB Local"')
+    for authorization in ["Basic invalid", "Bearer token", BasicAuth("wrong", "local-test-password").encode(), BasicAuth("admin", "bad").encode()]:
+        assert (await http.get("/api/state", headers={"Authorization": authorization})).status == 401
+    http.session.headers["Authorization"] = BasicAuth("admin", "local-test-password").encode()
     assert (await http.get("/api/state")).status == 200
     forbidden = await http.post("/api/account", json={}, headers={"Origin": "https://untrusted.example"})
     assert forbidden.status == 403
@@ -40,8 +42,31 @@ async def test_http_authentication_origin_and_validation(http):
     assert bad_host.status == 403
     assert (await http.post("/api/account", json={"email": "invalid"})).status == 400
     assert (await http.post(f"/api/vehicles/{VIN}/commands", json={"command": "unlock", "pin": "1234"})).status == 400
-    await http.delete("/api/session")
+    assert (await http.post("/api/session", json={"password": "local-test-password"})).status == 405
+    del http.session.headers["Authorization"]
     assert (await http.get("/api/state")).status == 401
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_username_health_and_attempt_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_USERNAME", "owner")
+    client = TestClient(TestServer(create_app(data_dir=tmp_path, password="test-secret")))
+    await client.start_server()
+    try:
+        good = {"Authorization": BasicAuth("owner", "test-secret").encode()}
+        bad = {"Authorization": BasicAuth("admin", "test-secret").encode()}
+        assert (await client.get("/api/state", headers=good)).status == 200
+        assert (await client.post("/api/session", headers=good, json={})).status == 405
+        for _ in range(10):
+            assert (await client.get("/api/state", headers=bad)).status == 401
+        blocked = await client.get("/api/state", headers=bad)
+        assert blocked.status == 429
+        assert blocked.headers["Retry-After"] == "300"
+        assert (await client.get("/api/health", headers=bad)).status == 200
+        assert (await client.get("/api/state", headers=good)).status == 200
+        assert (await client.get("/", cookies={"mb_session": "old-cookie"})).status == 401
+    finally:
+        await client.close()
 
 
 def test_token_encryption_and_delete(tmp_path):

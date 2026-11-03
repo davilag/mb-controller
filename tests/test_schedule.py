@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 import asyncio
 
+from aiohttp import BasicAuth
 from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
@@ -174,7 +175,7 @@ async def test_schedule_http_authorization_save_and_manual_override_guard(tmp_pa
     try:
         assert (await http.get("/api/schedule")).status == 401
         assert (await http.put("/api/schedule", json=config())).status == 401
-        await http.post("/api/session", json={"password": "test-only"})
+        http.session.headers["Authorization"] = BasicAuth("admin", "test-only").encode()
         assert (await http.put("/api/schedule", json=config(), headers={"Origin": "https://untrusted.example"})).status == 403
         # Fixed all-day target matches fake telemetry, so saving never sends a command.
         saved = await http.put("/api/schedule", json=config(entries=[{"time": "00:00", "maxSoc": 80}]))
