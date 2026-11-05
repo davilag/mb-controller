@@ -14,6 +14,7 @@ import uuid
 
 from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError, client_exceptions
 
+from server.connection_diagnostics import ConnectionDiagnostics
 from server.mbapi.app_version import AppVersionManager
 
 from .const import (
@@ -93,6 +94,7 @@ class Websocket:
         self._region = region
         self._app_version = app_version or AppVersionManager(region)
         self.connection_state = "unknown"
+        self.diagnostics = ConnectionDiagnostics()
         self.is_connecting = False
         self.ha_stop_handler = None
         self._watchdog: Watchdog = Watchdog(
@@ -146,12 +148,18 @@ class Websocket:
         # from re-arming watchdogs after the integration has been unloaded.
         self._unloaded: bool = False
 
+    def _connection_event(self, event, **fields):
+        if not hasattr(self, 'diagnostics'):
+            self.diagnostics = ConnectionDiagnostics()
+        self.diagnostics.record(event, **fields)
+
     async def _reconnect_attempt(self) -> None:
         """Attempt reconnection without cancelling the reconnect watchdog."""
         if self._is_orphaned():
             self._LOGGER.debug("Aborting reconnect attempt – instance is orphaned")
             return
 
+        self._connection_event("reconnect_attempt")
         self._LOGGER.debug("Starting reconnect attempt")
         try:
             await self._async_connect_internal()
@@ -261,6 +269,8 @@ class Websocket:
             "async_stop called (call #%d, is_stopping_already: %s)", self._async_stop_call_count, self.is_stopping
         )
         self.is_stopping = True
+        if self._unloaded:
+            self._connection_event("shutdown")
 
         # Watchdogs anhalten (graceful: laufenden expire-Task nicht killen)
         self._pingwatchdog.cancel(graceful=True)
@@ -313,6 +323,8 @@ class Websocket:
             await self._watchdog.trigger()
             return
 
+        self._connection_event("idle_timeout")
+
         # Verhindere Reentrancy: weitere Trigger sofort unterbinden, aber laufenden Task nicht killen
         self.is_stopping = True
         loop = asyncio.get_running_loop()
@@ -334,6 +346,7 @@ class Websocket:
                 self._LOGGER.debug("Skipping reconnect watchdog re-arm – instance unloaded")
             else:
                 # Wenn direkt ein Reconnect gewollt ist, hier starten:
+                self._connection_event("retry_scheduled", retry_at=time.time() + seconds_until_reconnect())
                 await self._reconnectwatchdog.trigger()
 
     async def ping(self):
@@ -462,6 +475,7 @@ class Websocket:
                     self.connection_state = STATE_RECONNECTING
                     await asyncio.sleep(seconds_until_reconnect())
             except client_exceptions.ClientConnectionError as cce:  # noqa: PERF203
+                self._connection_event("network_error")
                 retry_in = seconds_until_reconnect()
                 self._LOGGER.error("Could not connect: %s, retry in %s seconds...", cce, retry_in)
                 self._LOGGER.debug(cce)
@@ -469,6 +483,7 @@ class Websocket:
                 await asyncio.sleep(seconds_until_reconnect())
                 self.ws_connect_retry_counter += 1
             except ConnectionResetError as cce:
+                self._connection_event("network_error")
                 retry_in = seconds_until_reconnect()
                 self._LOGGER.info("Connection reseted: %s, retry in %s seconds...", cce, retry_in)
                 self._LOGGER.debug(cce)
@@ -476,6 +491,7 @@ class Websocket:
                 await asyncio.sleep(seconds_until_reconnect())
                 self.ws_connect_retry_counter += 1
             except WSServerHandshakeError as error:
+                self._connection_event("handshake_error", code=error.status)
                 retry_in = seconds_until_reconnect()
                 if not self.ws_blocked_connection_error_logged:
                     self._LOGGER.info(
@@ -518,6 +534,7 @@ class Websocket:
                 await asyncio.sleep(seconds_until_reconnect())
             except Exception as error:  # noqa: BLE001 - the reconnect backoff catch-all; every error type
                 # must reach the sleep and retry, not escape the loop
+                self._connection_event("unexpected_error")
                 retry_in = seconds_until_reconnect()
                 self._LOGGER.error("Other error: %s (%s)", error, type(error).__name__)
                 self.connection_state = STATE_RECONNECTING
@@ -533,6 +550,7 @@ class Websocket:
         self.is_connecting = True
         self._LOGGER.debug("Connecting to %s", websocket_url)
         self._connection = await session.ws_connect(websocket_url, **kwargs)
+        self._connection_event("connected")
         self._LOGGER.debug("Connected to mercedes websocket at %s", websocket_url)
 
         # Always reset to initial timeout for each new connection (including reconnects)
@@ -557,12 +575,16 @@ class Websocket:
 
             # Wichtig: alle Close-Varianten sauber behandeln
             if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+                if not self.is_stopping:
+                    self._connection_event("remote_close", code=msg.data if type(msg.data) is int else self._connection.close_code)
                 self._LOGGER.debug("websocket connection is closing (%s)", msg.type)
                 break
             if msg.type == WSMsgType.ERROR:
+                self._connection_event("socket_error", code=self._connection.close_code)
                 self._LOGGER.debug("websocket connection is closing - message type error.")
                 break
             if msg.type == WSMsgType.BINARY:
+                self.diagnostics.received()
                 self._queue.put_nowait(msg.data)
                 await self._pingwatchdog.trigger()
                 await self._watchdog.trigger()

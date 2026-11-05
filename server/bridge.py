@@ -270,6 +270,7 @@ class Bridge:
             "connection": socket.connection_state if socket else "disconnected",
             "error": self.error or ("Reconnect required." if self.runtime and self.runtime.reload_requested else None),
             "region": client._region if client else "Europe",
+            "connectionDiagnostics": socket.diagnostics.snapshot() if getattr(socket, "diagnostics", None) else None,
             "vehicles": [serialize_car(car) for car in client.cars.values()] if client else [],
         }
 

@@ -195,3 +195,8 @@ or 10:38 retries at 10:40; a failed attempt waits for the following boundary.
 Initial startup/account connection remains immediate. Existing idle-disconnect
 and user-command behavior is unchanged. Vehicle telemetry can be unavailable
 between reconnects, so the charging scheduler may wait for a connection.
+
+Connection diagnostics are available in authenticated `/api/state` under
+`connectionDiagnostics`. A bounded event history and the separate `mb.connection`
+logger distinguish local idle timeouts, remote WebSocket close codes, transport
+failures and HTTP handshake errors without logging credentials or message bodies.
