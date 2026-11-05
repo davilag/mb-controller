@@ -186,3 +186,12 @@ docker compose config
 ```
 
 See [THIRD_PARTY.md](THIRD_PARTY.md) for attribution and the pinned upstream revision.
+
+## Mercedes reconnection timing
+
+Automatic reconnects wait for the next wall-clock ten-minute boundary
+(`:00`, `:10`, `:20`, `:30`, `:40`, `:50`). A disconnect at either 10:32
+or 10:38 retries at 10:40; a failed attempt waits for the following boundary.
+Initial startup/account connection remains immediate. Existing idle-disconnect
+and user-command behavior is unchanged. Vehicle telemetry can be unavailable
+between reconnects, so the charging scheduler may wait for a connection.

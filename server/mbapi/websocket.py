@@ -35,13 +35,26 @@ DEFAULT_WATCHDOG_TIMEOUT = 30
 DEFAULT_WATCHDOG_TIMEOUT_CARCOMMAND = 180
 INITIAL_WATCHDOG_TIMEOUT = 30
 PING_WATCHDOG_TIMEOUT = 32
-RECONNECT_WATCHDOG_TIMEOUT = 60
+RECONNECT_BOUNDARY_SECONDS = 600
 STATE_CONNECTED = "connected"
 STATE_RECONNECTING = "reconnecting"
 INITIATE_RELOGIN_AFTER_429 = True
 MAX_RELOGIN_ATTEMPTS = 3
 
 LOGGER = logging.getLogger(__name__)
+
+
+def seconds_until_reconnect(now: float | None = None) -> float:
+    """Wait for the next :00/:10/:20/:30/:40/:50 boundary, never retry now."""
+    now = time.time() if now is None else now
+    return RECONNECT_BOUNDARY_SECONDS - now % RECONNECT_BOUNDARY_SECONDS
+
+
+class ReconnectWatchdog(Watchdog):
+    async def trigger(self):
+        # Recalculate on every arm, including failed reconnects.
+        self.timeout = seconds_until_reconnect()
+        await super().trigger()
 
 
 class _PrefixAdapter(logging.LoggerAdapter):
@@ -91,8 +104,8 @@ class Websocket:
         self._pingwatchdog: Watchdog = Watchdog(
             self.ping, topic="Ping", timeout_seconds=PING_WATCHDOG_TIMEOUT, log_events=False
         )
-        self._reconnectwatchdog: Watchdog = Watchdog(
-            self._reconnect_attempt, topic="Reconnect", timeout_seconds=RECONNECT_WATCHDOG_TIMEOUT, log_events=True
+        self._reconnectwatchdog: Watchdog = ReconnectWatchdog(
+            self._reconnect_attempt, topic="Reconnect", timeout_seconds=RECONNECT_BOUNDARY_SECONDS, log_events=True
         )
         self.component_reload_watcher: Watchdog = Watchdog(
             self._blocked_account_reload_check, 30, "Blocked_account_reload", False
@@ -182,7 +195,7 @@ class Websocket:
     async def _force_immediate_reconnect_for_command(self) -> None:
         """Bypass the reconnect cooldown for user-initiated car commands.
 
-        The reconnect watchdog normally waits RECONNECT_WATCHDOG_TIMEOUT seconds
+        The reconnect watchdog normally waits until the next ten-minute boundary
         after a disconnect (protects against 429 blocking under background traffic).
         A user-initiated car command must not be silently dropped during that window,
         so cancel the pending watchdog and clear is_stopping; the call() path will
@@ -435,8 +448,6 @@ class Websocket:
         self._LOGGER.debug("Queue handler stopped")
 
     async def _start_websocket_handler(self, session: ClientSession):
-        retry_in: int = 10
-
         self._LOGGER.debug(
             "_start_websocket_handler (is_stopping: %s, session.closed: %s)",
             self.is_stopping,
@@ -447,21 +458,25 @@ class Websocket:
             try:
                 await self.component_reload_watcher.trigger()
                 await self._websocket_handler(session)
+                if not self.is_stopping and not session.closed:
+                    self.connection_state = STATE_RECONNECTING
+                    await asyncio.sleep(seconds_until_reconnect())
             except client_exceptions.ClientConnectionError as cce:  # noqa: PERF203
+                retry_in = seconds_until_reconnect()
                 self._LOGGER.error("Could not connect: %s, retry in %s seconds...", cce, retry_in)
                 self._LOGGER.debug(cce)
                 self.connection_state = STATE_RECONNECTING
-                await asyncio.sleep(retry_in)
-                retry_in = retry_in * 2 if retry_in < 120 else 120
+                await asyncio.sleep(seconds_until_reconnect())
                 self.ws_connect_retry_counter += 1
             except ConnectionResetError as cce:
+                retry_in = seconds_until_reconnect()
                 self._LOGGER.info("Connection reseted: %s, retry in %s seconds...", cce, retry_in)
                 self._LOGGER.debug(cce)
                 self.connection_state = STATE_RECONNECTING
-                await asyncio.sleep(retry_in)
-                retry_in = retry_in * 2 if retry_in < 120 else 120
+                await asyncio.sleep(seconds_until_reconnect())
                 self.ws_connect_retry_counter += 1
             except WSServerHandshakeError as error:
+                retry_in = seconds_until_reconnect()
                 if not self.ws_blocked_connection_error_logged:
                     self._LOGGER.info(
                         "MB-API access blocked. (First Message, expect a re-login) %s, retry in %s seconds...",
@@ -500,14 +515,13 @@ class Websocket:
 
                 self.ws_connect_retry_counter += 1
                 self.connection_state = STATE_RECONNECTING
-                await asyncio.sleep(retry_in)
-                retry_in = 10 * self.ws_connect_retry_counter * self.ws_connect_retry_counter
+                await asyncio.sleep(seconds_until_reconnect())
             except Exception as error:  # noqa: BLE001 - the reconnect backoff catch-all; every error type
                 # must reach the sleep and retry, not escape the loop
+                retry_in = seconds_until_reconnect()
                 self._LOGGER.error("Other error: %s (%s)", error, type(error).__name__)
                 self.connection_state = STATE_RECONNECTING
-                await asyncio.sleep(retry_in)
-                retry_in = retry_in * 2 if retry_in < 120 else 120
+                await asyncio.sleep(seconds_until_reconnect())
                 self.ws_connect_retry_counter += 1
 
     async def _websocket_handler(self, session: ClientSession, **kwargs):
