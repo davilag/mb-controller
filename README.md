@@ -192,11 +192,39 @@ See [THIRD_PARTY.md](THIRD_PARTY.md) for attribution and the pinned upstream rev
 Automatic reconnects wait for the next wall-clock ten-minute boundary
 (`:00`, `:10`, `:20`, `:30`, `:40`, `:50`). A disconnect at either 10:32
 or 10:38 retries at 10:40; a failed attempt waits for the following boundary.
-Initial startup/account connection remains immediate. Existing idle-disconnect
-and user-command behavior is unchanged. Vehicle telemetry can be unavailable
-between reconnects, so the charging scheduler may wait for a connection.
+Initial startup/account connection remains immediate. The upstream 30-second
+idle disconnect is retained as account-throttling protection. Background reconnects
+follow the ten-minute grid; a due charge-limit command can reconnect on demand using
+upstream's command-only bypass. Scheduled commands retain at most three delayed
+attempts per daily period and stop issuing commands when rate limiting is detected.
+No password is retained or automatically re-entered. A matching reported charge
+limit is distinct from a newly acknowledged command; telemetry can be delayed.
 
 Connection diagnostics are available in authenticated `/api/state` under
 `connectionDiagnostics`. A bounded event history and the separate `mb.connection`
 logger distinguish local idle timeouts, remote WebSocket close codes, transport
 failures and HTTP handshake errors without logging credentials or message bodies.
+
+## Upstream findings (2026-11-05)
+
+- [#449](https://github.com/ReneNulschDE/mbapi2020/issues/449#issuecomment-5928026090):
+  the maintainer explicitly says the 30-second idle disconnect is intentional
+  protection against Mercedes account throttling. Do not "fix" this by keeping
+  an otherwise idle socket alive indefinitely. The maintainer's reported daily
+  connected-time threshold is an observation, not an official Mercedes guarantee.
+- [#407](https://github.com/ReneNulschDE/mbapi2020/issues/407#issuecomment-4395172359):
+  actual commands must bypass background reconnect cooldowns; otherwise they can
+  be silently dropped. The standalone wrapper must not preempt that path merely
+  because the socket is currently idle. Never mark a command sent after a failed
+  transport call, and never mark vehicle application confirmed on transport alone.
+- [#467](https://github.com/ReneNulschDE/mbapi2020/issues/467): a connected socket
+  does not guarantee current telemetry. In that report, accepting updated privacy
+  terms in the official app resolved missing data; this is not evidence that every
+  missing update is the same problem.
+- Follow upstream's [account guidance](https://github.com/ReneNulschDE/mbapi2020#how-to-prevent-account-blocking):
+  use a dedicated invited secondary account for the integration rather than using
+  the same account concurrently in the integration and official apps.
+
+The UI distinguishes intentional idle from rate limiting. Operational monitors
+should not treat routine protective idle as an outage; failures, rate limiting,
+and unconfirmed schedule application still require attention.

@@ -110,6 +110,7 @@ async def test_real_upstream_unlock_protobuf_and_command_rejections(tmp_path):
             await bridge.command(VIN, "lock")
         bridge.last_sent = 0
         client.websocket._connection.closed = True
+        send.side_effect = BridgeError("Vehicle connection is offline")
         with pytest.raises(BridgeError, match="offline"):
             await bridge.command(VIN, "lock")
     finally:
@@ -207,3 +208,33 @@ def test_charge_limit_uses_advertised_bounds_and_requires_max_soc_support():
     assert charge_limit_options(car) == [60, 70, 80, 90]
     car.features["CHARGE_PROGRAM_CONFIGURE"] = False
     assert charge_limit_options(car) == []
+
+
+@pytest.mark.asyncio
+async def test_command_reconnects_from_idle_without_password_login(tmp_path):
+    bridge = Bridge(tmp_path)
+    await bridge.create_client({"region": "Europe"})
+    client = bridge.client
+    car = Car(VIN)
+    car.features = {"DOORS_LOCK": True}
+    client.cars[VIN] = car
+    socket = client.websocket
+    socket.is_stopping = True
+    transport = SimpleNamespace(closed=False, send_bytes=AsyncMock(), close=AsyncMock())
+    async def connect():
+        socket._connection = transport
+    socket.async_connect = AsyncMock(side_effect=connect)
+    client.oauth.async_login_new = AsyncMock()
+    try:
+        result = await bridge.command(VIN, "lock")
+        assert result["state"] == "sent"
+        socket.async_connect.assert_awaited_once()
+        transport.send_bytes.assert_awaited_once()
+        client.oauth.async_login_new.assert_not_awaited()
+        bridge.last_sent = 0
+        socket.account_blocked = True
+        with pytest.raises(BridgeError, match="rate limited"):
+            await bridge.command(VIN, "lock")
+        assert transport.send_bytes.await_count == 1
+    finally:
+        await bridge.stop()

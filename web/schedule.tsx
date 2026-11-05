@@ -84,6 +84,6 @@ export function ScheduleControl({ vin, options, schedule, busy, onSave, onDisabl
       </fieldset>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
     </form>
-    <p className="small schedule-note">Keep the backend running and connected to Mercedes. Changes are normally checked within 20 seconds; vehicle confirmation can take longer.</p>
+    <p className="small schedule-note">Keep the backend running. An idle Mercedes connection is normal; a due command reconnects on demand. Checks run every 20 seconds with up to three delayed attempts. Saved or sent does not mean confirmed by the car.</p>
   </section>;
 }

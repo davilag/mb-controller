@@ -6,7 +6,7 @@ import { ScheduleControl, type ChargeSchedule, type ScheduleConfig } from './sch
 type Attribute = { value: unknown; display: unknown; unit: string | null; status: string; updatedAt: unknown };
 type Command = { id: string; label: string; available: boolean; requiresPin: boolean; chargeLimits?: number[]; maxSoc?: number };
 type Vehicle = { vin: string; name: string; plate: string; updatedAt: number | null; attributes: Record<string, Attribute>; commands: Command[]; lastCommand: { type: string; state: string; error: string; timestamp: number } };
-type State = { configured: boolean; connected: boolean; connection: string; error: string | null; region: string; vehicles: Vehicle[]; schedule?: ChargeSchedule };
+type State = { intentionalIdle?: boolean; accountBlocked?: boolean; configured: boolean; connected: boolean; connection: string; error: string | null; region: string; vehicles: Vehicle[]; schedule?: ChargeSchedule };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...options?.headers } });
@@ -131,7 +131,7 @@ function App() {
       {error ? <div className="message error" role="alert">{error}</div> : null}
       {notice ? <div className="message" role="status">{notice}</div> : null}
       <>
-        <div className="toolbar"><span className={`connection ${state.connected ? 'online' : ''}`}><i />{state.connected ? 'Mercedes connection live' : state.configured ? 'Connecting to Mercedes…' : 'Account not connected'}</span><div className="toolbar-actions">{state.configured ? <button disabled={busy} onClick={() => setShowConnect(value => !value)}>{showConnect ? 'Close account form' : 'Reconnect account'}</button> : null}</div></div>
+        <div className="toolbar"><span className={`connection ${state.connected ? 'online' : ''}`}><i />{state.connected ? 'Mercedes connection live' : state.accountBlocked ? 'Mercedes account rate limited' : state.intentionalIdle ? 'Mercedes connection idle (account protection)' : state.configured ? 'Connecting to Mercedes…' : 'Account not connected'}</span><div className="toolbar-actions">{state.configured ? <button disabled={busy} onClick={() => setShowConnect(value => !value)}>{showConnect ? 'Close account form' : 'Reconnect account'}</button> : null}</div></div>
         {state.error ? <div className="message error" role="alert">{state.error}</div> : null}
         {!state.configured || showConnect ? <section className="panel connect"><div><p className="eyebrow">01 / CONNECT</p><h2>Connect your account</h2><p>Use the account linked to your vehicle in the Mercedes-Benz app.</p><p className="small">This unofficial integration uses Mercedes cloud services. Sign in to the official app first. Accounts requiring MFA are not supported by this login flow.</p><a className="text-link" href="https://github.com/ReneNulschDE/mbapi2020" target="_blank" rel="noreferrer">Based on mbapi2020 ↗</a></div><form onSubmit={connect}>
           <label>Mercedes email<input name="email" type="email" autoComplete="username" required disabled={busy} placeholder="you@example.com" /></label>

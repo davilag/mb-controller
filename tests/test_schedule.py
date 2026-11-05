@@ -121,8 +121,8 @@ async def test_persistence_and_reconnection_catch_up(tmp_path):
     assert restored.config == config()
     bridge.online = False
     await restored.tick(now=instant("2026-11-02T06:00Z"), monotonic=0)
-    bridge.command.assert_not_awaited()
-    assert restored.status == "waiting"
+    bridge.command.assert_awaited_once_with(VIN, "charge_limit", max_soc=50)
+    assert restored.status == "pending"
     bridge.online = True
     await restored.tick(now=instant("2026-11-02T06:00Z"), monotonic=20)
     bridge.command.assert_awaited_once_with(VIN, "charge_limit", max_soc=50)
@@ -191,3 +191,29 @@ async def test_schedule_http_authorization_save_and_manual_override_guard(tmp_pa
         bridge.command.assert_awaited_once_with(VIN, "charge_limit", "", 70)
     finally:
         await http.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_account_never_triggers_scheduled_command(tmp_path):
+    bridge = FakeBridge(tmp_path)
+    bridge.state = lambda: {"connected": False, "accountBlocked": True}
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config())
+    for monotonic in (0, 20, 120, 600):
+        await scheduler.tick(now=instant("2026-11-02T06:00Z"), monotonic=monotonic)
+    bridge.command.assert_not_awaited()
+    assert scheduler.attempts == 0
+    assert scheduler.status == 'error'
+
+
+@pytest.mark.asyncio
+async def test_offline_command_failures_remain_bounded(tmp_path):
+    bridge = FakeBridge(tmp_path)
+    bridge.online = False
+    bridge.command.side_effect = BridgeError('Transport unavailable')
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config())
+    for monotonic in range(0, 1000, 20):
+        await scheduler.tick(now=instant("2026-11-02T06:00Z"), monotonic=monotonic)
+    assert bridge.command.await_count == 3
+    assert scheduler.status == 'error'

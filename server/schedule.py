@@ -152,8 +152,11 @@ class ChargeScheduler:
                 self.attempts, self.next_try = 0, 0
             client = self.bridge.client
             car = client.cars.get(self.config["vin"]) if client else None
-            if not car or not self.bridge.state()["connected"] or self.bridge.operation_lock.locked():
+            if not car or self.bridge.operation_lock.locked():
                 self.status, self.message = "waiting", "Waiting for the scheduled vehicle to connect."
+                return
+            if self.bridge.state().get("accountBlocked"):
+                self.status, self.message = "error", "Mercedes has rate limited the account. Scheduled commands are paused."
                 return
             target = window["target"]
             if target not in charge_limit_options(car):
@@ -164,7 +167,7 @@ class ChargeScheduler:
                 self.status, self.message = "waiting", "Waiting for reported charge-limit data."
                 return
             if current == target:
-                self.status, self.message = "active", f"Vehicle reports the scheduled {target}% limit."
+                self.status, self.message = "active", f"Last reported vehicle limit matches the scheduled {target}% target."
                 self.attempts, self.next_try = 0, 0
                 return
             if monotonic < self.next_try:

@@ -38,10 +38,12 @@ class LocalClient(Client):
         self.sent_request = None
 
     async def execute_car_command(self, message):
-        # Fail visibly when disconnected instead of returning a misleading success.
-        socket = self.websocket._connection
-        if not socket or socket.closed:
-            raise BridgeError("Vehicle connection is offline. Wait for it to reconnect.")
+        # Preserve upstream's command-only reconnect bypass (#407), while keeping
+        # background cooldowns and account-block protection intact.
+        if getattr(self.websocket, "_unloaded", False):
+            raise BridgeError("Vehicle connection is offline. Reconnect your account.")
+        if getattr(self.websocket, "account_blocked", False):
+            raise BridgeError("Mercedes has rate limited this account. Commands are paused.")
         await super().execute_car_command(message)
         self.sent_request = message.commandRequest.request_id
 
@@ -265,8 +267,13 @@ class Bridge:
         client = self.client
         socket = client.websocket if client else None
         connected = bool(socket and socket._connection and not socket._connection.closed)
+        idle = bool(socket and not connected and getattr(socket, "is_stopping", False)
+                    and not getattr(socket, "_unloaded", False)
+                    and not getattr(socket, "account_blocked", False) and not self.error)
         return {
             "configured": bool(client and client.cars), "connected": connected,
+            "intentionalIdle": idle,
+            "accountBlocked": bool(socket and getattr(socket, "account_blocked", False)),
             "connection": socket.connection_state if socket else "disconnected",
             "error": self.error or ("Reconnect required." if self.runtime and self.runtime.reload_requested else None),
             "region": client._region if client else "Europe",
