@@ -56,3 +56,15 @@ async def test_idle_watchdog_records_local_cause_before_shutdown():
     await socket.initiatiate_connection_disconnect_with_reconnect()
     await socket._shutdown_task
     assert socket.diagnostics.snapshot()['events'][-1]['event'] == 'idle_timeout'
+
+
+def test_new_connection_resets_silence_baseline(monkeypatch):
+    evidence = ConnectionDiagnostics()
+    monkeypatch.setattr('server.connection_diagnostics.time.time', lambda: 1000)
+    evidence.record('connected')
+    evidence.received()
+    monkeypatch.setattr('server.connection_diagnostics.time.time', lambda: 1600)
+    evidence.record('connected')
+    monkeypatch.setattr('server.connection_diagnostics.time.time', lambda: 1630)
+    evidence.record('idle_timeout')
+    assert evidence.snapshot()['events'][-1]['silenceSeconds'] == 30

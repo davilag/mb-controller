@@ -28,7 +28,7 @@ class ConnectionDiagnostics:
         if event == 'connected':
             self.last_connected = now
         if event == 'idle_timeout':
-            baseline = self.last_message or self.last_connected
+            baseline = max(self.last_message or 0, self.last_connected or 0) or None
             item['silenceSeconds'] = round(now - baseline, 1) if baseline else None
             item['messagesReceived'] = self.messages
         if type(retry_at) in (float, int):
