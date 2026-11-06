@@ -129,8 +129,9 @@ uv run --with-requirements requirements-dev.txt python -m pytest -q
 npm ci
 npm run build
 # Optional UI check (owns a disposable static server; no Mercedes calls):
-uv run --with playwright playwright install chromium
+uv run --with playwright playwright install chromium webkit
 uv run --with playwright python scripts/check-mobile.py
+MB_UI_ENGINE=webkit uv run --with playwright python scripts/check-mobile.py
 ```
 
 The browser check verifies 320/390/768/1280px layouts, 44px touch controls, no horizontal

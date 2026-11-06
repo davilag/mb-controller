@@ -28,8 +28,9 @@ async def main():
             'entries': [{'time': '23:30', 'maxSoc': 80}, {'time': '05:30', 'maxSoc': 50}]},
             'timezone': 'Europe/London', 'status': 'disabled', 'message': 'Quiet. No night scheduled.', 'jobs': [], 'nextChangeAt': None}}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(executable_path=os.environ.get("MB_UI_CHROMIUM"))
-        page = await browser.new_page()
+        engine = os.environ.get("MB_UI_ENGINE", "chromium")
+        browser = await getattr(p, engine).launch(**({"executable_path": os.environ["MB_UI_CHROMIUM"]} if engine == "chromium" and os.environ.get("MB_UI_CHROMIUM") else {}))
+        page = await browser.new_page(is_mobile=True, has_touch=True, device_scale_factor=3, locale="en-GB")
         errors = []
         page.on('pageerror', lambda e: errors.append(str(e)))
         async def route_api(route):
@@ -57,14 +58,27 @@ async def main():
             for element in await page.locator('button:visible,input:visible,select:visible').all():
                 box = await element.bounding_box()
                 assert box['height'] >= 44, f'Touch target too small at {width}: {box}'
-            await page.screenshot(path=str(artifacts/f'quiet-{width}.png'), full_page=True)
+                if await element.evaluate("el => el.closest('.schedule-panel') !== null"):
+                    assert await element.evaluate("""el => {
+                        const r = el.getBoundingClientRect();
+                        const parent = el.closest('label') || el.closest('fieldset');
+                        const p = parent.getBoundingClientRect();
+                        const panel = el.closest('.schedule-panel').getBoundingClientRect();
+                        return r.left >= p.left - 1 && r.right <= p.right + 1 && r.right <= panel.right - 1;
+                    }"""), f'Control escapes its container at {width}'
+            controls = await page.locator('.step-fields input,.step-fields select').all()
+            boxes = [await el.bounding_box() for el in controls]
+            for i, a in enumerate(boxes):
+                for b in boxes[i+1:]:
+                    assert not (a['x'] < b['x']+b['width']-1 and a['x']+a['width'] > b['x']+1 and a['y'] < b['y']+b['height']-1 and a['y']+a['height'] > b['y']+1), f'Overlapping fields at {width}'
+            await page.screenshot(path=str(artifacts/f'{engine}-quiet-{width}.png'), full_page=True)
         await page.set_viewport_size({'width': 390, 'height': 844})
         await page.get_by_label('Night starting').fill('2099-11-06')
         await page.get_by_label('Evening percentage').select_option('80')
         await page.get_by_role('button', name='Schedule this night').click()
         await page.get_by_text('Night armed', exact=True).wait_for()
         assert state['schedule']['config']['mode'] == 'oneNight'
-        await page.screenshot(path=str(artifacts/'armed-390.png'), full_page=True)
+        await page.screenshot(path=str(artifacts/f'{engine}-armed-390.png'), full_page=True)
         await page.get_by_role('button', name='Cancel night').click()
         await page.get_by_text('Not armed', exact=True).wait_for()
         assert not state['schedule']['config']['enabled']
@@ -73,10 +87,10 @@ async def main():
         await page.set_viewport_size({'width': 320, 'height': 844}); await page.reload()
         await page.get_by_text('Mercedes rate limited the last connection.', exact=False).wait_for()
         assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
-        await page.screenshot(path=str(artifacts/'cooldown-320.png'), full_page=True)
+        await page.screenshot(path=str(artifacts/f'{engine}-cooldown-320.png'), full_page=True)
         assert not errors, errors
         await browser.close()
     if server: server.shutdown(); server.server_close()
-    print('PASS: 320/390/768/1280px, no overflow, 44px controls, arm/cancel, cooldown, no JavaScript errors. Synthetic API only.')
+    print(f'PASS {engine}: mobile/touch 320/390/768/1280px, containment, no overlapping controls, 44px targets, arm/cancel, cooldown, no JS errors. Synthetic API only.')
 
 asyncio.run(main())
