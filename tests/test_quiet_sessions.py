@@ -140,3 +140,28 @@ async def test_fresh_session_confirms_then_always_closes(tmp_path, initial, expe
     assert result.get("confirmedAt")
     assert bridge.client is None and bridge.runtime is None and bridge.task is None
     assert bridge.state()["vehicles"][0]["attributes"]["electric.max_soc"]["value"] == 80
+
+
+@pytest.mark.asyncio
+async def test_429_without_retry_after_has_no_invented_day_pause(tmp_path):
+    bridge = Bridge(tmp_path)
+    bridge.store.save({"token": {"refresh_token": "fake"}})
+    bridge.discover = AsyncMock(side_effect=MercedesRateLimitError())
+    result = await bridge.scheduled_charge(VIN, 80)
+    assert result["status"] == "failed"
+    assert "No cooldown duration was supplied" in result["message"]
+    assert Bridge(tmp_path).cooldown_until() == 0
+    assert bridge.client is None and bridge.task is None
+    bridge.discover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_short_provider_retry_after_is_not_extended_to_a_day(tmp_path):
+    import time
+    bridge = Bridge(tmp_path)
+    bridge.store.save({"token": {"refresh_token": "fake"}})
+    bridge.discover = AsyncMock(side_effect=MercedesRateLimitError("600"))
+    result = await bridge.scheduled_charge(VIN, 80)
+    assert result["status"] == "failed"
+    remaining = Bridge(tmp_path).cooldown_until() - time.time()
+    assert 590 < remaining <= 600

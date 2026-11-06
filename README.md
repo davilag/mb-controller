@@ -102,10 +102,11 @@ pending changes without contacting Mercedes. Replacing a night also remains loca
 - Missed slots more than 90 seconds late are marked **Missed**, never caught up. This grace
   only accommodates timer/startup jitter. After the second slot, the schedule disarms itself.
 - HTTP 429 from discovery, auth refresh or the WebSocket immediately fails the session.
-  The app persists a conservative **24-hour minimum safety cooldown**, extended if Mercedes
-  supplies a longer `Retry-After`. Slots falling within that cooldown are skipped without
-  connecting, and manual account login is blocked too. This is a local safety policy,
-  **not a guarantee that Mercedes removes the restriction after 24 hours**.
+  Only a future Mercedes `Retry-After` creates a persisted cooldown. Slots within that
+  provider-supplied pause are skipped without connecting, and explicit login is paused too.
+  Without `Retry-After`, a 429 fails this session without automatic retries or an invented
+  waiting period. The next explicitly scheduled slot or manual login can attempt again;
+  this does not establish that Mercedes has removed the restriction.
 - The former recurring daily schedule is deliberately **not migrated into an armed night**.
   Previously selected vehicle details remain available locally; migrated limit choices are
   checked against current vehicle capabilities when the scheduled session actually runs.

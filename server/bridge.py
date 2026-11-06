@@ -256,9 +256,9 @@ class Bridge:
                 socket = self.client.websocket if self.client else None
                 if getattr(exc, "status", None) == 429 or getattr(socket, "account_blocked", False):
                     # A conservative safety pause, not a claim about Mercedes' recovery time.
-                    self.safety["cooldownUntil"] = max(time.time() + 86400, getattr(socket, "retry_after_until", 0), getattr(exc, "retry_after_until", 0))
+                    self.safety["cooldownUntil"] = max(self.cooldown_until(), getattr(socket, "retry_after_until", 0), getattr(exc, "retry_after_until", 0))
                     self.safety_store.save(self.safety)
-                    message = "Mercedes rate limited this session. No retries; further connections paused for at least 24 hours."
+                    message = "Mercedes rate limited this session. No automatic retry will be made." + (" Further connections are paused until its Retry-After expires." if self.cooldown_until() > time.time() else " No cooldown duration was supplied.")
                 else:
                     message = str(exc) if isinstance(exc, BridgeError) else "Could not confirm this change within its connection window. No retry will be made."
                 return {"status": "failed", "sentAt": sent_at, "message": message}
@@ -290,10 +290,10 @@ class Bridge:
                     self.cache_vehicles()
                     await self.stop()
             except MercedesRateLimitError as exc:
-                self.safety["cooldownUntil"] = max(time.time() + 86400, exc.retry_after_until)
+                self.safety["cooldownUntil"] = max(self.cooldown_until(), exc.retry_after_until)
                 self.safety_store.save(self.safety)
                 await self.stop()
-                raise BridgeError("Mercedes rate limited account setup. Connections are paused for at least 24 hours.") from None
+                raise BridgeError("Mercedes rate limited account setup. No automatic retry will be made.") from None
             except MBAuth2FAError:
                 await self.stop()
                 raise BridgeError("This upstream login flow does not support accounts that require MFA. Use an eligible secondary vehicle account.") from None
