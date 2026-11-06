@@ -28,3 +28,21 @@ class MBAuth2FAError(ConfigEntryAuthFailed):
 
 class MBLegalTermsError(ConfigEntryAuthFailed):
     """Define an error related to acceptance of legal terms."""
+
+
+class MercedesRateLimitError(Exception):
+    """Safe rate-limit signal; never retain provider bodies or authorization headers."""
+    status = 429
+
+    def __init__(self, retry_after=""):
+        import time
+        from email.utils import parsedate_to_datetime
+        self.retry_after_until = 0
+        try:
+            self.retry_after_until = time.time() + max(0, float(retry_after))
+        except (TypeError, ValueError):
+            try:
+                self.retry_after_until = parsedate_to_datetime(retry_after).timestamp()
+            except (ValueError, TypeError, OverflowError):
+                pass
+        super().__init__("Mercedes rate limited the request.")

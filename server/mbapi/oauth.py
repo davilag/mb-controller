@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .errors import MercedesRateLimitError
+
 from ..runtime import ConfigEntry, HomeAssistant, async_create_clientsession
 
 import asyncio
@@ -169,7 +171,7 @@ class Oauth:
             self.code_verifier = None
             self.code_challenge = None
 
-        except (MBAuth2FAError, MBLegalTermsError):
+        except (MBAuth2FAError, MBLegalTermsError, MercedesRateLimitError):
             raise
         except Exception as e:
             _LOGGER.error("OAuth2 login failed: %s", e)
@@ -209,6 +211,8 @@ class Oauth:
 
         for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
             async with self._session.request(method, url, **kwargs) as response:
+                if response.status == 429:
+                    raise MercedesRateLimitError(response.headers.get("Retry-After", ""))
                 if response.status in GATEWAY_ERROR_CODES and attempt < LOGIN_MAX_ATTEMPTS:
                     _LOGGER.warning(
                         "%s failed with %s - retry %s/%s",
@@ -604,6 +608,8 @@ class Oauth:
             self._session = async_create_clientsession(self._hass, verify_ssl=VERIFY_SSL, cookie_jar=cookie_jar)
 
         async with self._session.request(method, url, data=data, **kwargs) as resp:
+            if resp.status == 429:
+                raise MercedesRateLimitError(resp.headers.get("Retry-After", ""))
             if 400 <= resp.status <= 500:
                 try:
                     error = await resp.text()

@@ -1,89 +1,65 @@
 import { useEffect, useState } from 'react';
 
 export type ScheduleEntry = { time: string; maxSoc: number };
-export type ScheduleConfig = { enabled: boolean; vin: string; entries: ScheduleEntry[] };
-export type ChargeSchedule = {
-  config: ScheduleConfig; timezone: string; status: string; message: string;
-  target: number; nextChangeAt: string; nextTarget: number; lastSentAt: string | null; attempts: number;
-};
-
-const defaults: ScheduleEntry[] = [{ time: '05:30', maxSoc: 50 }, { time: '23:30', maxSoc: 80 }];
+export type ScheduleConfig = { mode: 'oneNight'; enabled: boolean; vin: string; date: string; entries: ScheduleEntry[] };
+export type Job = { at: string; target: number; status: string; message: string; sentAt: string | null; confirmedAt: string | null };
+export type ChargeSchedule = { config: ScheduleConfig; timezone: string; status: string; message: string; jobs: Job[]; nextChangeAt: string | null };
+const defaults = [{ time: '23:30', maxSoc: 80 }, { time: '05:30', maxSoc: 50 }];
+function today(zone: string) { return new Intl.DateTimeFormat('en-CA', {timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date()); }
+function localDate(value: string) { const [y, m, d] = value.split('-').map(Number); return new Date(y, m - 1, d, 12); }
+const labels: Record<string, string> = { scheduled: 'Scheduled', running: 'Connecting', confirmed: 'Confirmed by car', already_set: 'Already at target', failed: 'Not confirmed', missed: 'Missed', interrupted: 'Interrupted', cancelled: 'Cancelled' };
 
 export function ScheduleControl({ vin, options, schedule, busy, onSave, onDisable }: {
   vin: string; options: number[]; schedule?: ChargeSchedule; busy: boolean;
-  onSave: (config: ScheduleConfig) => Promise<ChargeSchedule>;
-  onDisable: () => Promise<ChargeSchedule>;
+  onSave: (config: ScheduleConfig) => Promise<ChargeSchedule>; onDisable: () => Promise<ChargeSchedule>;
 }) {
-  const initial = schedule?.config;
-  const [entries, setEntries] = useState<ScheduleEntry[]>(initial?.entries ?? defaults);
-  const [enabled, setEnabled] = useState(Boolean(initial?.enabled && initial.vin === vin));
+  const timezone = schedule?.timezone ?? 'Europe/London';
+  const [date, setDate] = useState(today(timezone));
+  const [entries, setEntries] = useState<ScheduleEntry[]>(defaults);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
-  const configKey = JSON.stringify(schedule?.config);
   const active = Boolean(schedule?.config.enabled && schedule.config.vin === vin);
-  const timezone = schedule?.timezone ?? 'Europe/London';
-  const nextTime = schedule ? new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: timezone }).format(new Date(schedule.nextChangeAt)) : '';
-
+  const key = JSON.stringify(schedule?.config);
   useEffect(() => {
-    if (!dirty && schedule) {
-      setEntries(schedule.config.entries.map(entry => ({ ...entry })));
-      setEnabled(schedule.config.enabled && schedule.config.vin === vin);
-    }
-  }, [configKey, dirty, vin]);
-
+    if (!dirty && active && schedule) { setDate(schedule.config.date); setEntries(schedule.config.entries); }
+  }, [key, dirty, vin]);
   function change(index: number, update: Partial<ScheduleEntry>) {
     setEntries(current => current.map((entry, i) => i === index ? { ...entry, ...update } : entry));
     setDirty(true); setSaved(false); setError('');
   }
-
   async function save(event: React.FormEvent) {
-    event.preventDefault();
-    setSaving(true); setSaved(false); setError('');
-    try {
-      const result = await onSave({ vin, enabled, entries });
-      setEntries(result.config.entries); setEnabled(result.config.enabled); setDirty(false); setSaved(true);
-    } catch (error) { setError((error as Error).message); }
-    finally { setSaving(false); }
+    event.preventDefault(); setSaving(true); setError(''); setSaved(false);
+    try { await onSave({ mode: 'oneNight', vin, date, enabled: true, entries }); setDirty(false); setSaved(true); }
+    catch (e) { setError((e as Error).message); } finally { setSaving(false); }
   }
-
   async function disable() {
     setSaving(true); setError('');
-    try {
-      await onDisable(); setEnabled(false); setDirty(false); setSaved(true);
-    } catch (error) { setError((error as Error).message); }
-    finally { setSaving(false); }
+    try { await onDisable(); setDirty(false); setSaved(false); }
+    catch (e) { setError((e as Error).message); } finally { setSaving(false); }
   }
-
-  function addPeriod() {
-    const used = new Set(entries.map(entry => entry.time));
-    const time = Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, '0')}:00`).find(time => !used.has(time)) ?? '12:30';
-    setEntries(current => [...current, { time, maxSoc: options[0] ?? 50 }]);
-    setDirty(true); setSaved(false);
-  }
-
+  const endDay = localDate(date);
+  if (entries[1].time < entries[0].time) endDay.setDate(endDay.getDate() + 1);
+  const dayLabel = (d: Date) => Number.isNaN(d.getTime()) ? 'Choose a date' : new Intl.DateTimeFormat('en-GB', {weekday: 'short', day: 'numeric', month: 'short'}).format(d);
   return <section className="panel schedule-panel" aria-labelledby="schedule-title">
-    <div className="section-heading"><div><p className="eyebrow">DAILY AUTOMATION</p><h2 id="schedule-title">Charge-limit schedule</h2></div><span className={`schedule-badge ${active ? 'enabled' : ''}`}>{active ? 'Schedule on' : 'Schedule off'}</span></div>
-    <p>Set a limit for each part of the day. Each period lasts until the next start time, including overnight.</p>
-    <p className="small">All times use {timezone}, including daylight saving. Runs on your server with the browser closed.</p>
-    {active && schedule ? <div className={`schedule-status ${schedule.status === 'error' ? 'schedule-error' : ''}`} role="status"><strong>Current target: {schedule.target}%</strong><span>{schedule.message}</span><span>Next: {schedule.nextTarget}% at {nextTime}.</span></div> : null}
-    {schedule?.config.enabled && schedule.config.vin !== vin ? <p className="small">A schedule is active for another vehicle. Saving an enabled schedule here will replace it.</p> : null}
+    <div className="section-heading"><div><p className="eyebrow">ONE NIGHT ONLY</p><h2 id="schedule-title">Plan your charge</h2></div><span className={`schedule-badge ${active ? 'enabled' : ''}`}>{active ? 'Night armed' : 'Not armed'}</span></div>
+    <p>Two limit changes. One night. Nothing repeats.</p>
     <form onSubmit={save}>
-      <fieldset disabled={busy || saving}>
-        <legend className="sr-only">Daily charging periods</legend>
-        <div className="schedule-rows">{entries.map((entry, index) => <div className="schedule-row" key={index}>
-          <label>Period {index + 1} starts<input type="time" step="60" required value={entry.time} onChange={event => change(index, { time: event.target.value })} /></label>
-          <label>Charge limit<select value={entry.maxSoc} onChange={event => change(index, { maxSoc: Number(event.target.value) })} required disabled={!options.length}>{options.map(value => <option value={value} key={value}>{value}%</option>)}</select></label>
-          <button type="button" className="remove-period" aria-label={`Remove period ${index + 1}`} disabled={entries.length === 1} onClick={() => { setEntries(current => current.filter((_, i) => i !== index)); setDirty(true); setSaved(false); }}>Remove</button>
+      <fieldset disabled={busy || saving || schedule?.status === 'pending'}>
+        <legend className="sr-only">One-night charging plan</legend>
+        <label className="night-date">Night starting<input type="date" required min={today(timezone)} value={date} onChange={e => { setDate(e.target.value); setDirty(true); setSaved(false); }} /></label>
+        <div className="night-steps">{entries.map((entry, i) => <div className="night-step" key={i}>
+          <div className="step-heading"><span className="step-number">{i + 1}</span><div><h3>{i === 0 ? 'Evening limit' : 'Morning limit'}</h3><p className="small">{dayLabel(i === 0 ? localDate(date) : endDay)}</p></div></div>
+          <div className="step-fields"><label>{i === 0 ? 'Evening time' : 'Morning time'}<input type="time" step="60" required value={entry.time} onChange={e => change(i, {time: e.target.value})} /></label><label>{i === 0 ? 'Evening percentage' : 'Morning percentage'}<select required value={entry.maxSoc} onChange={e => change(i, {maxSoc: Number(e.target.value)})}>{options.map(value => <option key={value} value={value}>{value}%</option>)}</select></label></div>
         </div>)}</div>
-        <button type="button" className="add-period" disabled={entries.length >= 12} onClick={addPeriod}>+ Add period</button>
-        <label className="schedule-toggle"><input type="checkbox" checked={enabled} disabled={!options.length} onChange={event => { setEnabled(event.target.checked); setDirty(true); setSaved(false); }} /><span>Enable daily schedule</span></label>
-        <p className="small">Saving an enabled schedule applies the current period immediately and maintains its limit. A lower limit won’t discharge the battery.</p>
-        <div className="schedule-actions"><button className="primary" type="submit" disabled={!options.length}>{saving ? 'Saving…' : enabled ? 'Save and enable schedule' : 'Save schedule'}</button>{active ? <button type="button" onClick={() => void disable()}>Turn schedule off</button> : null}{dirty ? <span className="small">Unsaved changes</span> : saved ? <span className="small" role="status">Schedule saved.</span> : null}</div>
+        <p className="small">Times are {timezone}, including daylight saving. A lower limit won’t discharge the battery.</p>
+        <div className="schedule-actions"><button className="primary" type="submit" disabled={!options.length}>{saving ? 'Saving…' : active ? 'Replace this night' : 'Schedule this night'}</button>{active ? <button type="button" onClick={() => void disable()}>Cancel night</button> : null}</div>
+        <p className="small" role="status">{saved ? 'Night saved. No connection is made until the scheduled time.' : dirty ? 'Unsaved changes' : 'Stays quiet before, between and after your two changes.'}</p>
       </fieldset>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
     </form>
-    <p className="small schedule-note">Keep the backend running. An idle Mercedes connection is normal; a due command reconnects on demand. Checks run every 20 seconds with up to three delayed attempts. Saved or sent does not mean confirmed by the car.</p>
+    {schedule?.jobs.length ? <div className="night-result" aria-live="polite"><h3>{active ? 'Scheduled night' : 'Last night plan'}</h3><p className={schedule.status === 'error' ? 'error-text' : 'small'}>{schedule.message}</p><ol className="job-list">{schedule.jobs.map((job, i) => <li key={job.at}><div className="job-summary"><strong>{new Intl.DateTimeFormat('en-GB', {timeZone: timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'}).format(new Date(job.at))} · {job.target}%</strong><span className={`job-state ${job.status}`}>{labels[job.status] ?? job.status}</span></div><p className="small">{job.message}</p></li>)}</ol></div> : <p className="small schedule-note">{schedule?.message}</p>}
+    <p className="small schedule-note">Keep this server running. Each change opens one short connection to send and confirm the limit, then closes it. No automatic retries. Unconfirmed changes need checking in the Mercedes app.</p>
   </section>;
 }

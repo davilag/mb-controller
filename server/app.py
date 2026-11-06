@@ -129,14 +129,7 @@ def create_app(*, data_dir=None, password=None):
         return web.json_response({**bridge.state(), "schedule": scheduler.snapshot()})
 
     async def command(request):
-        data = await request.json()
-        name, pin = data.get("command"), data.get("pin", "")
-        if not isinstance(name, str) or not isinstance(pin, str):
-            raise BridgeError("Invalid command or security PIN.")
-        if name == "charge_limit" and scheduler.config["enabled"] and scheduler.config["vin"] == request.match_info["vin"]:
-            raise BridgeError("Turn off the charge schedule before setting a manual limit.")
-        result = await bridge.command(request.match_info["vin"], name, pin, data.get("maxSoc"))
-        return web.json_response(result, status=202)
+        raise BridgeError("Remote commands are disabled in quiet mode. Schedule a one-night charge change instead.")
 
     async def frontend(request):
         dist = ROOT / "dist"

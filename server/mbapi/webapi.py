@@ -18,6 +18,7 @@ from server.mbapi.app_version import AppVersionManager
 from .const import REGION_CHINA, RIS_OS_VERSION, SYSTEM_PROXY, VERIFY_SSL, WEBSOCKET_USER_AGENT, WEBSOCKET_USER_AGENT_CN
 from .helper import UrlHelper as helper
 from .oauth import Oauth
+from .errors import MercedesRateLimitError
 from .proto import vehicle_events_pb2
 
 LOGGER = logging.getLogger(__name__)
@@ -84,6 +85,8 @@ class WebApi:
         try:
             if "url" in kwargs:
                 async with self._session.request(method, **kwargs) as resp:
+                    if resp.status == 429:
+                        raise MercedesRateLimitError(resp.headers.get("Retry-After", ""))
                     # resp.raise_for_status()
                     if return_as_json:
                         return await resp.json(content_type=None)
@@ -91,6 +94,8 @@ class WebApi:
                     return await resp.read()
             else:
                 async with self._session.request(method, url, **kwargs) as resp:
+                    if resp.status == 429:
+                        raise MercedesRateLimitError(resp.headers.get("Retry-After", ""))
                     if 400 <= resp.status < 500:
                         try:
                             error = await resp.text()
@@ -111,6 +116,8 @@ class WebApi:
 
                     return await resp.read()
 
+        except MercedesRateLimitError:
+            raise
         except ClientError as err:
             LOGGER.debug(traceback.format_exc())
             if not ignore_errors:

@@ -1,172 +1,169 @@
+"""No live Mercedes requests: one-night persistence, timing and fail-closed execution."""
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
-import asyncio
 
 from aiohttp import BasicAuth
 from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
-from server.bridge import BridgeError
-from server.mbapi.car import Car, CarAttribute, Electric
-from server.schedule import ChargeScheduler, DEFAULT_ENTRIES, normalize_config, schedule_window
+from server.bridge import BridgeError, Bridge
+from server.runtime import TokenStore
+from server.schedule import ChargeScheduler, DEFAULT_ENTRIES, normalize_config, make_jobs, local_transition
 
 VIN = "WDD00000000000001"
 LONDON = ZoneInfo("Europe/London")
-
-
 def instant(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def config(enabled=True, entries=None):
-    return {"enabled": enabled, "vin": VIN, "entries": deepcopy(entries if entries is not None else DEFAULT_ENTRIES)}
-
+def config(**updates):
+    return {"mode": "oneNight", "enabled": True, "date": "2026-11-06", "vin": VIN,
+            "entries": deepcopy(DEFAULT_ENTRIES), **updates}
+BEFORE = instant("2026-11-06T16:00Z")
 
 class FakeBridge:
-    """Never connects to Mercedes or transmits real vehicle commands."""
     def __init__(self, directory):
         self.directory = directory
-        self.online = True
-        car = Car(VIN)
-        car.features = {"BATTERY_MAX_SOC_CONFIGURE": True}
-        car.electric = Electric()
-        car.electric.max_soc = CarAttribute(80, "VALID", 1)
-        self.client = SimpleNamespace(cars={VIN: car})
-        self.operation_lock = asyncio.Lock()
-        self.command_lock = asyncio.Lock()
-        self.command = AsyncMock(return_value={"state": "sent", "requestId": "test-only"})
-
+        self.scheduled_charge = AsyncMock(return_value={"status": "confirmed", "sentAt": "2026-11-06T23:30:01+00:00", "confirmedAt": "2026-11-06T23:30:04+00:00", "message": "Vehicle confirmed 80%."})
+        self.restore, self.stop = AsyncMock(), AsyncMock()
+        self.cached = [{"vin": VIN, "commands": [{"id": "charge_limit", "chargeLimits": [50, 60, 70, 80, 90, 100]}]}]
     def state(self):
-        return {"connected": self.online}
+        return {"vehicles": self.cached}
 
-    async def restore(self):
-        pass
+@pytest.mark.parametrize("data", [config(mode="daily"), config(date="not-a-date"), config(entries=[]),
+    config(entries=[{"time": "23:30", "maxSoc": 80}]),
+    config(entries=[{"time": "24:00", "maxSoc": 80}, {"time": "05:30", "maxSoc": 50}]),
+    config(entries=[{"time": "23:30", "maxSoc": True}, {"time": "05:30", "maxSoc": 50}]),
+    config(entries=[{"time": "23:30", "maxSoc": 55}, {"time": "05:30", "maxSoc": 50}]),
+    config(entries=[{"time": "23:30", "maxSoc": 80}, {"time": "23:30", "maxSoc": 50}])])
+def test_reject_recurring_or_invalid_config(data):
+    with pytest.raises(BridgeError): normalize_config(data)
 
-    async def stop(self):
-        pass
+@pytest.mark.parametrize("day,expected", [("2026-11-06", ["2026-11-06T23:30Z", "2026-11-07T05:30Z"]),
+    ("2026-07-06", ["2026-07-06T22:30Z", "2026-07-07T04:30Z"])])
+def test_absolute_dates_overnight_and_bst(day, expected):
+    jobs = make_jobs(config(date=day), LONDON)
+    assert [instant(j["at"]) for j in jobs] == [instant(v) for v in expected]
 
-
-@pytest.mark.parametrize("now,target,next_time,next_target", [
-    ("2026-11-02T00:00Z", 80, "2026-11-02T05:30Z", 50),
-    ("2026-11-02T05:29:59Z", 80, "2026-11-02T05:30Z", 50),
-    ("2026-11-02T05:30Z", 50, "2026-11-02T23:30Z", 80),
-    ("2026-11-02T23:29:59Z", 50, "2026-11-02T23:30Z", 80),
-    ("2026-11-02T23:30Z", 80, "2026-11-03T05:30Z", 50),
-    ("2026-11-02T23:59:59Z", 80, "2026-11-03T05:30Z", 50),
-    ("2026-07-02T04:30Z", 50, "2026-07-02T22:30Z", 80),
-])
-def test_daily_boundaries_midnight_and_bst(now, target, next_time, next_target):
-    window = schedule_window(DEFAULT_ENTRIES, instant(now), LONDON)
-    assert window["target"] == target
-    assert instant(window["nextChangeAt"]) == instant(next_time)
-    assert window["nextTarget"] == next_target
-
-
-def test_dst_skipped_and_repeated_local_times():
-    entries = [{"time": "00:00", "maxSoc": 50}, {"time": "01:30", "maxSoc": 80}, {"time": "03:00", "maxSoc": 50}]
-    before = schedule_window(entries, instant("2026-03-29T00:59Z"), LONDON)
-    assert before["target"] == 50
-    assert instant(before["nextChangeAt"]) == instant("2026-03-29T01:00Z")
-    assert schedule_window(entries, instant("2026-03-29T01:00Z"), LONDON)["target"] == 80
-    # After the clocks repeat 01:00, don't undo the 01:30 change already made.
-    assert schedule_window(entries, instant("2026-10-25T00:30Z"), LONDON)["target"] == 80
-    assert schedule_window(entries, instant("2026-10-25T01:10Z"), LONDON)["target"] == 80
-
-
-@pytest.mark.parametrize("entries", [
-    [], [{"time": "24:00", "maxSoc": 50}], [{"time": "5:30", "maxSoc": 50}],
-    [{"time": "05:60", "maxSoc": 50}], [{"time": "05:30", "maxSoc": 55}],
-    [{"time": "05:30", "maxSoc": True}], [{"time": "05:30", "maxSoc": "80"}],
-    [{"time": "05:30", "maxSoc": 50}, {"time": "05:30", "maxSoc": 80}],
-])
-def test_reject_invalid_or_duplicate_periods(entries):
-    with pytest.raises(BridgeError):
-        normalize_config(config(entries=entries))
-
+def test_dst_repeated_and_skipped_times():
+    from datetime import date
+    assert local_transition(date(2026, 3, 29), "01:30", LONDON) == instant("2026-03-29T01:00Z")
+    assert local_transition(date(2026, 10, 25), "01:30", LONDON) == instant("2026-10-25T00:30Z")
 
 @pytest.mark.asyncio
-async def test_scheduler_applies_current_period_then_waits_for_confirmation(tmp_path):
+async def test_save_read_restart_and_cancel_are_network_silent(tmp_path):
+    bridge = FakeBridge(tmp_path)
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config(), now=BEFORE)
+    for now in [BEFORE, instant("2026-11-06T23:29:59Z")]:
+        await scheduler.tick(now=now)
+        scheduler.snapshot()
+    restored = ChargeScheduler(bridge)
+    assert restored.config == config()
+    assert VIN.encode() not in restored.store.path.read_bytes()
+    await restored.disable()
+    await restored.tick(now=instant("2026-11-06T23:30Z"))
+    bridge.scheduled_charge.assert_not_awaited()
+    assert not ChargeScheduler(bridge).config["enabled"]
+
+@pytest.mark.asyncio
+async def test_exactly_two_connections_then_quiet_forever(tmp_path):
+    bridge = FakeBridge(tmp_path)
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config(), now=BEFORE)
+    await scheduler.tick(now=instant("2026-11-06T23:30Z"))
+    bridge.scheduled_charge.assert_awaited_once_with(VIN, 80)
+    assert scheduler.jobs[0]["status"] == "confirmed"
+    for now in ["2026-11-06T23:30:20Z", "2026-11-07T01:00Z", "2026-11-07T05:29:59Z"]:
+        await scheduler.tick(now=instant(now))
+    assert bridge.scheduled_charge.await_count == 1
+    bridge.scheduled_charge.return_value = {"status": "confirmed", "message": "Vehicle confirmed 50%."}
+    await scheduler.tick(now=instant("2026-11-07T05:30:01Z"))
+    bridge.scheduled_charge.assert_awaited_with(VIN, 50)
+    assert bridge.scheduled_charge.await_count == 2
+    assert scheduler.status == "completed" and not scheduler.config["enabled"]
+    restored = ChargeScheduler(bridge)
+    for now in ["2026-11-07T23:30Z", "2026-11-08T05:30Z", "2026-12-06T23:30Z"]:
+        await restored.tick(now=instant(now))
+    assert bridge.scheduled_charge.await_count == 2
+
+@pytest.mark.asyncio
+async def test_failed_attempt_never_retries_and_does_not_replay_on_restart(tmp_path):
+    bridge = FakeBridge(tmp_path)
+    bridge.scheduled_charge.return_value = {"status": "failed", "message": "No confirmation"}
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config(), now=BEFORE)
+    await scheduler.tick(now=instant("2026-11-06T23:30Z"))
+    scheduler = ChargeScheduler(bridge)
+    for second in [1, 10, 30, 60]:
+        await scheduler.tick(now=instant(f"2026-11-06T23:3{second//60}:{second%60:02}Z"))
+    bridge.scheduled_charge.assert_awaited_once_with(VIN, 80)
+    assert scheduler.jobs[0]["status"] == "failed"
+
+@pytest.mark.asyncio
+async def test_old_daily_schedule_retired_locally(tmp_path):
+    old = {"enabled": True, "vin": VIN, "entries": [{"time": "05:30", "maxSoc": 50}, {"time": "23:30", "maxSoc": 80}]}
+    TokenStore(tmp_path, "schedule.enc").save(old)
     bridge = FakeBridge(tmp_path)
     scheduler = ChargeScheduler(bridge)
     assert not scheduler.config["enabled"]
-    await scheduler.save(config())
-    morning = instant("2026-11-02T06:00Z")
-    await scheduler.tick(now=morning, monotonic=0)
-    bridge.command.assert_awaited_once_with(VIN, "charge_limit", max_soc=50)
-    assert scheduler.status == "pending"
-    await scheduler.tick(now=morning, monotonic=20)
-    assert bridge.command.await_count == 1
-    bridge.client.cars[VIN].electric.max_soc.value = 50
-    await scheduler.tick(now=morning, monotonic=40)
-    assert scheduler.status == "active"
-    await scheduler.tick(now=instant("2026-11-02T23:30Z"), monotonic=60)
-    assert bridge.command.await_count == 2
-    bridge.command.assert_awaited_with(VIN, "charge_limit", max_soc=80)
-    await scheduler.disable()
-    await scheduler.tick(now=morning, monotonic=1000)
-    assert bridge.command.await_count == 2
-    assert scheduler.status == "disabled"
-
+    await scheduler.tick(now=instant("2026-11-06T23:30Z"))
+    bridge.scheduled_charge.assert_not_awaited()
+    actual = Bridge(tmp_path)
+    await actual.restore()
+    assert actual.client is None
+    assert actual.state()["vehicles"][0]["vin"] == VIN
 
 @pytest.mark.asyncio
-async def test_persistence_and_reconnection_catch_up(tmp_path):
+async def test_crash_after_persisting_running_is_not_replayed(tmp_path):
     bridge = FakeBridge(tmp_path)
     scheduler = ChargeScheduler(bridge)
-    await scheduler.save(config())
-    assert VIN.encode() not in scheduler.store.path.read_bytes()
-    restored = ChargeScheduler(bridge)
-    assert restored.config == config()
-    bridge.online = False
-    await restored.tick(now=instant("2026-11-02T06:00Z"), monotonic=0)
-    bridge.command.assert_awaited_once_with(VIN, "charge_limit", max_soc=50)
-    assert restored.status == "pending"
-    bridge.online = True
-    await restored.tick(now=instant("2026-11-02T06:00Z"), monotonic=20)
-    bridge.command.assert_awaited_once_with(VIN, "charge_limit", max_soc=50)
-    await restored.disable()
-    assert not ChargeScheduler(bridge).config["enabled"]
-
+    await scheduler.save(config(), now=BEFORE)
+    scheduler.jobs[0]["status"] = "running"
+    scheduler.persist()
+    restarted = ChargeScheduler(bridge)
+    assert restarted.jobs[0]["status"] == "interrupted"
+    await restarted.tick(now=instant("2026-11-06T23:30:02Z"))
+    bridge.scheduled_charge.assert_not_awaited()
 
 @pytest.mark.asyncio
-async def test_retries_are_delayed_and_bounded(tmp_path):
+async def test_missing_startup_deadlines_are_skipped_not_caught_up(tmp_path):
     bridge = FakeBridge(tmp_path)
     scheduler = ChargeScheduler(bridge)
-    await scheduler.save(config())
-    now = instant("2026-11-02T06:00Z")
-    for tick, expected_count in [(0, 1), (119, 1), (120, 2), (359, 2), (360, 3), (839, 3), (840, 3), (1000, 3)]:
-        await scheduler.tick(now=now, monotonic=tick)
-        assert bridge.command.await_count == expected_count
-    assert scheduler.status == "error"
-    await scheduler.save(config())
-    await scheduler.tick(now=now, monotonic=1001)
-    assert bridge.command.await_count == 4
-
+    await scheduler.save(config(), now=BEFORE)
+    await scheduler.tick(now=instant("2026-11-07T06:00Z"))
+    assert [j["status"] for j in scheduler.jobs] == ["missed", "missed"]
+    assert not scheduler.config["enabled"]
+    bridge.scheduled_charge.assert_not_awaited()
 
 @pytest.mark.asyncio
-async def test_missing_telemetry_and_unsupported_targets_never_send(tmp_path):
+async def test_no_past_save_and_no_unsupported_limits(tmp_path):
     bridge = FakeBridge(tmp_path)
     scheduler = ChargeScheduler(bridge)
-    await scheduler.save(config())
-    car = bridge.client.cars[VIN]
-    car.electric.max_soc.retrievalstatus = "NOT_RECEIVED"
-    await scheduler.tick(now=instant("2026-11-02T06:00Z"), monotonic=0)
-    assert scheduler.status == "waiting"
-    bridge.command.assert_not_awaited()
-    car.features = {}
-    await scheduler.tick(now=instant("2026-11-02T06:00Z"), monotonic=20)
-    assert scheduler.status == "error"
-    bridge.command.assert_not_awaited()
+    with pytest.raises(BridgeError, match="future"):
+        await scheduler.save(config(), now=instant("2026-11-07T06:00Z"))
+    bridge.cached[0]["commands"][0]["chargeLimits"] = [50]
     with pytest.raises(BridgeError, match="not supported"):
-        await scheduler.save(config())
-    await scheduler.disable()  # Turning off remains possible when capabilities disappear.
-    assert scheduler.status == "disabled"
-
+        await scheduler.save(config(), now=BEFORE)
+    bridge.scheduled_charge.assert_not_awaited()
 
 @pytest.mark.asyncio
-async def test_schedule_http_authorization_save_and_manual_override_guard(tmp_path, monkeypatch):
+async def test_persistence_failure_cannot_send_and_keeps_previous_plan(tmp_path, monkeypatch):
+    bridge = FakeBridge(tmp_path)
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config(), now=BEFORE)
+    original = deepcopy(scheduler.config)
+    def fail(_): raise OSError("read only")
+    monkeypatch.setattr(scheduler.store, "save", fail)
+    with pytest.raises(OSError): await scheduler.save(config(date="2026-11-08"), now=BEFORE)
+    assert scheduler.config == original
+    with pytest.raises(OSError): await scheduler.tick(now=instant("2026-11-06T23:30Z"))
+    bridge.scheduled_charge.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_http_reads_and_schedule_save_do_not_connect(tmp_path, monkeypatch):
     import server.app as app_module
     bridge = FakeBridge(tmp_path)
     monkeypatch.setattr(app_module, "Bridge", lambda directory: bridge)
@@ -174,46 +171,38 @@ async def test_schedule_http_authorization_save_and_manual_override_guard(tmp_pa
     await http.start_server()
     try:
         assert (await http.get("/api/schedule")).status == 401
-        assert (await http.put("/api/schedule", json=config())).status == 401
         http.session.headers["Authorization"] = BasicAuth("admin", "test-only").encode()
-        assert (await http.put("/api/schedule", json=config(), headers={"Origin": "https://untrusted.example"})).status == 403
-        # Fixed all-day target matches fake telemetry, so saving never sends a command.
-        saved = await http.put("/api/schedule", json=config(entries=[{"time": "00:00", "maxSoc": 80}]))
+        future = config(date="2099-11-06")
+        assert (await http.put("/api/schedule", json=future, headers={"Origin": "https://untrusted.example"})).status == 403
+        saved = await http.put("/api/schedule", json=future)
         assert saved.status == 200
-        assert (await saved.json())["config"]["enabled"]
-        manual = await http.post(f"/api/vehicles/{VIN}/commands", json={"command": "charge_limit", "maxSoc": 70})
-        assert manual.status == 400
-        assert "Turn off" in (await manual.json())["error"]
-        bridge.command.assert_not_awaited()
+        for _ in range(3):
+            assert (await http.get("/api/state")).status == 200
+        manual = await http.post(f"/api/vehicles/{VIN}/commands", json={"command": "charge_limit", "maxSoc": 80})
+        assert manual.status == 400 and 'quiet mode' in (await manual.json())["error"]
         assert (await http.delete("/api/schedule")).status == 200
-        manual = await http.post(f"/api/vehicles/{VIN}/commands", json={"command": "charge_limit", "maxSoc": 70})
-        assert manual.status == 202
-        bridge.command.assert_awaited_once_with(VIN, "charge_limit", "", 70)
-    finally:
-        await http.close()
+        bridge.scheduled_charge.assert_not_awaited()
+    finally: await http.close()
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_account_never_triggers_scheduled_command(tmp_path):
+async def test_cancel_unconfigured_and_disabled_draft_restore_cleanly(tmp_path):
     bridge = FakeBridge(tmp_path)
-    bridge.state = lambda: {"connected": False, "accountBlocked": True}
     scheduler = ChargeScheduler(bridge)
-    await scheduler.save(config())
-    for monotonic in (0, 20, 120, 600):
-        await scheduler.tick(now=instant("2026-11-02T06:00Z"), monotonic=monotonic)
-    bridge.command.assert_not_awaited()
-    assert scheduler.attempts == 0
-    assert scheduler.status == 'error'
+    await scheduler.disable()
+    assert ChargeScheduler(bridge).status == "disabled"
+    await scheduler.save(config(enabled=False), now=BEFORE)
+    restored = ChargeScheduler(bridge)
+    assert restored.status == "disabled" and not restored.jobs
+    bridge.scheduled_charge.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_offline_command_failures_remain_bounded(tmp_path):
+async def test_cannot_arm_a_night_inside_the_safety_cooldown(tmp_path):
     bridge = FakeBridge(tmp_path)
-    bridge.online = False
-    bridge.command.side_effect = BridgeError('Transport unavailable')
+    bridge.state = lambda: {"vehicles": bridge.cached, "cooldownUntil": "2026-11-07T16:10:00+00:00"}
     scheduler = ChargeScheduler(bridge)
-    await scheduler.save(config())
-    for monotonic in range(0, 1000, 20):
-        await scheduler.tick(now=instant("2026-11-02T06:00Z"), monotonic=monotonic)
-    assert bridge.command.await_count == 3
-    assert scheduler.status == 'error'
+    with pytest.raises(BridgeError, match="cooldown"):
+        await scheduler.save(config(), now=BEFORE)
+    await scheduler.save(config(date="2026-11-07"), now=BEFORE)
+    bridge.scheduled_charge.assert_not_awaited()

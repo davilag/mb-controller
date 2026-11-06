@@ -81,48 +81,63 @@ the vehicle PIN are entered in the web UI, not added to Compose. An HTTPS
 reverse proxy is optional for trusted local-only access and recommended for
 access across untrusted networks. The image includes an `/api/health` check.
 
-## POC features
+## One-night charging
 
-- Mercedes password login, encrypted token persistence and token refresh.
-- Assigned vehicle discovery, vehicle picker, protobuf WebSocket telemetry, and reconnect handling.
-- Battery/fuel/range/odometer/locks plus a searchable table of received attributes.
-- Lock/unlock, preconditioning start/stop, auxiliary heating start/stop, and flash lights,
-  gated by the capabilities Mercedes reports for each vehicle.
-- Charge-limit selector (50–100% in 10% steps, restricted to advertised bounds).
-  Uses the supported charging command and preserves the active program; a requested
-  limit is not displayed as confirmed until vehicle telemetry reports it.
-- Configurable daily charge-limit schedule that runs on the backend with the browser closed.
-- Explicit confirmation for commands; unlock asks for the four-digit vehicle security PIN.
-- Command submission is reported as **sent**, never as vehicle completion. Last reported
-  command state/errors appear separately and may refer to another command until an update arrives.
-- Disconnect deletes saved account tokens. HTTP Basic credentials are cached by your
-  browser; close its session or use a private window to avoid sharing access.
+MB Local is quiet by default. Its mobile-friendly page lets you choose a **night starting**
+date and exactly two changes, for example **80% at 23:30** and **50% at 05:30 the next day**.
+Click **Schedule this night**. Nothing repeats the following night. **Cancel night** removes
+pending changes without contacting Mercedes. Replacing a night also remains local-only.
 
-## Daily charge-limit schedule
+- Startup, restarts, browser refreshes, health checks, API state reads, saving and cancelling
+  do **not** refresh Mercedes tokens, fetch vehicle data or open a WebSocket.
+- At each due time the server opens **one** session, with a 65-second overall deadline for
+  token refresh if necessary, discovery, fresh telemetry, command submission and confirmation.
+  It closes the socket and HTTP sessions after success or failure. There is no background
+  reconnect loop, automatic command retry, password relogin or keep-alive between slots.
+- A fresh matching vehicle limit is labelled **Already at target** without sending a command.
+  Otherwise the UI says **Confirmed by car** only after a new telemetry update reports the
+  requested target. A sent request without matching telemetry is **Not confirmed**.
+- Every slot is durably marked as running **before** opening the connection. An interrupted
+  slot is not replayed after restart, even if the command may have reached the car.
+- Missed slots more than 90 seconds late are marked **Missed**, never caught up. This grace
+  only accommodates timer/startup jitter. After the second slot, the schedule disarms itself.
+- HTTP 429 from discovery, auth refresh or the WebSocket immediately fails the session.
+  The app persists a conservative **24-hour minimum safety cooldown**, extended if Mercedes
+  supplies a longer `Retry-After`. Slots falling within that cooldown are skipped without
+  connecting, and manual account login is blocked too. This is a local safety policy,
+  **not a guarantee that Mercedes removes the restriction after 24 hours**.
+- The former recurring daily schedule is deliberately **not migrated into an armed night**.
+  Previously selected vehicle details remain available locally; migrated limit choices are
+  checked against current vehicle capabilities when the scheduled session actually runs.
+- Manual remote command endpoints are disabled in quiet mode. Initial/replacement account
+  setup is an explicit exception: it contacts Mercedes once for login and vehicle discovery,
+  then closes the HTTP sessions without starting background telemetry.
 
-In **Charge-limit schedule**, edit the start time and target percentage for each period.
-The initial example is **50% at 05:30** and **80% at 23:30**. Each target lasts until the next
-period; the last wraps to the next day. Add or remove periods as needed. Turn on **Enable daily
-schedule** and click **Save and enable schedule** to activate it. Saving while the checkbox is off
-only stores the configuration and does not send a vehicle command.
+All times use the backend's `TZ`, default **Europe/London**, including BST/GMT changes.
+Skipped spring times run at the next valid local minute; repeated autumn times use their
+first occurrence. The UI previews the separate evening and morning calendar dates.
 
-All times use the backend's `TZ` setting, defaulting to **Europe/London**, including BST/GMT changes.
-On the spring clock change, a time skipped by the clock runs at the next valid local minute;
-on the autumn change, a repeated time runs on its first occurrence. Docker includes timezone data.
+Keep the server running overnight; this is **not** a schedule stored inside the car.
+Lowering the limit will not discharge the battery. Check an unconfirmed or failed slot in the
+official Mercedes app. Configuration, execution records, cached vehicle details, tokens and
+cooldown persist encrypted in the Docker data volume. Run exactly one backend per volume.
 
-The scheduler applies the active period when enabled, after startup or reconnection, and at each
-boundary. It checks every 20 seconds and maintains the active target if it observes a different
-reported limit. While enabled, manual limit changes in this app are blocked; **Turn schedule off**
-first to set a manual limit. Lowering a charge limit does not discharge the battery.
+### Verification
 
-Settings persist encrypted in the same data volume as the account. The server and Mercedes
-connection must remain available; this is not a schedule stored in the car. If the backend was
-offline at a boundary, it applies the current period when it reconnects rather than replaying
-missed periods. A requested change remains pending until vehicle telemetry confirms the target.
-Up to three requests are sent, with retries after 2 and then 4 minutes. If the third request
-is still unconfirmed after another 8 minutes, the UI reports an error. Save the schedule again
-to retry. Each new period gets a fresh retry allowance.
-Disconnecting the account disables the schedule.
+```bash
+uv run --with-requirements requirements-dev.txt python -m pytest -q
+npm ci
+npm run build
+# Optional UI check (owns a disposable static server; no Mercedes calls):
+uv run --with playwright playwright install chromium
+uv run --with playwright python scripts/check-mobile.py
+```
+
+The browser check verifies 320/390/768/1280px layouts, 44px touch controls, no horizontal
+page overflow, arm/cancel interactions, and cooldown display. Screenshots go to
+`/tmp/mb-one-night-ui`. Set `MB_UI_TEST_ORIGIN` for another frontend server, or
+`MB_UI_CHROMIUM` for an existing Chromium executable. All API responses in that check
+are synthetic; backend transport tests also use local fakes, not real vehicle commands.
 
 ## Account requirements and limits
 
@@ -132,17 +147,15 @@ The upstream password flow does not support MFA-required accounts. Prefer a dedi
 vehicle account when possible; simultaneous use of unofficial and official clients can cause
 account blocking. See the upstream README for its account recommendations.
 
-This is an early POC using an unofficial cloud API. Login and telemetry have been observed on
-the connected EQB; charge-limit commands and overnight scheduling still need live verification.
-Available features differ by vehicle, region, and subscription. China login,
-engine start, route sending, vehicle-stored departure schedules, and charging start/stop are outside this POC.
-Empty metrics mean data has not arrived or is not available; no telemetry is invented.
+This is an unofficial cloud integration. Previous scheduled 80% and 50% changes were
+confirmed by vehicle telemetry; the new one-night strategy is tested using local transport
+fakes without sending extra live commands. Available capabilities differ by vehicle and subscription.
 
 The password and vehicle PIN are not saved. Refresh tokens are encrypted in the Docker volume,
 with the encryption key in the same private volume; this protects token files, not a compromised
 server or a full-volume backup. Back up the volume privately. Run one backend process per volume.
-After restart the app attempts token refresh and reconnects; if Mercedes requires login again,
-use **Reconnect account**. Upstream automatic credential login is unavailable because the password
+After restart the app remains quiet. If a scheduled session reports expired credentials,
+use **Account** to set up the account again when no rate-limit cooldown is active. Upstream automatic credential login is unavailable because the password
 is not retained. Protect internet-facing access with an authenticated HTTPS proxy.
 
 ## Local development
@@ -187,23 +200,19 @@ docker compose config
 
 See [THIRD_PARTY.md](THIRD_PARTY.md) for attribution and the pinned upstream revision.
 
-## Mercedes reconnection timing
+## Connection lifecycle and monitoring
 
-Automatic reconnects wait for the next wall-clock ten-minute boundary
-(`:00`, `:10`, `:20`, `:30`, `:40`, `:50`). A disconnect at either 10:32
-or 10:38 retries at 10:40; a failed attempt waits for the following boundary.
-Initial startup/account connection remains immediate. The upstream 30-second
-idle disconnect is retained as account-throttling protection. Background reconnects
-follow the ten-minute grid; a due charge-limit command can reconnect on demand using
-upstream's command-only bypass. Scheduled commands retain at most three delayed
-attempts per daily period and stop issuing commands when rate limiting is detected.
-No password is retained or automatically re-entered. A matching reported charge
-limit is distinct from a newly acknowledged command; telemetry can be delayed.
+The vendored protocol retains its old reconnect implementation for upstream compatibility,
+but the app runs sockets in **single-attempt mode**. This bypasses all reconnect/relogin
+loops and refuses command or acknowledgement sends that would open a second socket.
+The upstream 30-second idle protection remains; the entire scheduled session also has
+an outer deadline. No reconnect watchdog or component reload watcher is armed for a slot.
 
-Connection diagnostics are available in authenticated `/api/state` under
-`connectionDiagnostics`. A bounded event history and the separate `mb.connection`
-logger distinguish local idle timeouts, remote WebSocket close codes, transport
-failures and HTTP handshake errors without logging credentials or message bodies.
+Authenticated `/api/state` exposes `quietMode`, `intentionalIdle`, `accountBlocked`,
+`cooldownUntil`, cached vehicle details and the current session's sanitized
+`connectionDiagnostics`. Expected disconnected state is not an outage. Inspect each
+`schedule.jobs` execution status to monitor confirmation, missed slots and failures;
+a saved schedule or sent command alone is not confirmation.
 
 ## Upstream findings (2026-11-05)
 

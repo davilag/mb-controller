@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import time
 import uuid
 from pathlib import Path
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from .mbapi.car import Car, CarAttribute
 from .mbapi.client import Client
-from .mbapi.errors import MBAuth2FAError, MBAuthError, MBLegalTermsError
+from .mbapi.errors import MBAuth2FAError, MBAuthError, MBLegalTermsError, MercedesRateLimitError
 from .mbapi.proto import client_pb2
 from .runtime import ConfigEntry, HomeAssistant, TokenStore, async_get_clientsession
 
@@ -44,6 +44,8 @@ class LocalClient(Client):
             raise BridgeError("Vehicle connection is offline. Reconnect your account.")
         if getattr(self.websocket, "account_blocked", False):
             raise BridgeError("Mercedes has rate limited this account. Commands are paused.")
+        if getattr(self.websocket, "single_attempt", False) and not (self.websocket._connection and not self.websocket._connection.closed):
+            raise BridgeError("The scheduled connection closed. No automatic retry will be made.")
         await super().execute_car_command(message)
         self.sent_request = message.commandRequest.request_id
 
@@ -170,6 +172,20 @@ class Bridge:
         self.operation_lock = asyncio.Lock()
         self.command_lock = asyncio.Lock()
         self.last_sent = 0
+        self.vehicle_store = TokenStore(directory, "vehicles.enc")
+        self.safety_store = TokenStore(directory, "connection-safety.enc")
+        self.cached = self.vehicle_store.load() or {"vehicles": [], "region": "Europe"}
+        self.safety = self.safety_store.load() or {}
+        self.last_diagnostics = None
+        # Local-only migration: retain the old vehicle selection, never its recurring schedule.
+        if not self.cached.get("vehicles"):
+            old = TokenStore(directory, "schedule.enc").load()
+            vin = old.get("vin") or old.get("config", {}).get("vin")
+            if vin:
+                self.cached["vehicles"] = [{"vin": vin, "name": "Mercedes-Benz", "plate": "Saved vehicle",
+                    "attributes": {}, "updatedAt": None, "lastCommand": {},
+                    "commands": [{"id": "charge_limit", "available": True, "chargeLimits": list(range(50, 101, 10))}]}]
+                self.vehicle_store.save(self.cached)
 
     async def create_client(self, data):
         self.runtime = HomeAssistant(self.directory, self.store)
@@ -179,18 +195,90 @@ class Bridge:
         await self.client.set_rlock_mode()
 
     async def restore(self):
+        """Restore local metadata only. No token refresh, discovery or socket traffic."""
+        return
+
+    def cache_vehicles(self):
+        if self.client and self.client.cars:
+            self.cached = {"vehicles": [serialize_car(car) for car in self.client.cars.values()], "region": self.client._region}
+            self.vehicle_store.save(self.cached)
+
+    def cooldown_until(self):
+        return self.safety.get("cooldownUntil", 0)
+
+    async def scheduled_charge(self, vin, target):
+        """One bounded connection session; no retry, relogin or background polling."""
+        if time.time() < self.cooldown_until():
+            raise BridgeError("Mercedes cooldown is active. This change was skipped without connecting.")
         async with self.operation_lock:
+            sent_at = None
+            self.error = None
             try:
-                data = self.store.load()
-                if data.get("token"):
+                async with asyncio.timeout(65):
+                    data = self.store.load()
+                    if not data.get("token"):
+                        raise BridgeError("Account setup is required before scheduling.")
                     await self.create_client(data)
-                    async with asyncio.timeout(100):
-                        await self.discover()
-            except Exception:
-                self.error = "Could not restore your vehicle connection. Reconnect your account."
-                await self.stop()
+                    self.client.websocket.single_attempt = True
+                    await self.discover()
+                    client = self.client
+                    if vin not in client.cars:
+                        raise BridgeError("Scheduled vehicle is no longer assigned to this account.")
+                    car = client.cars[vin]
+                    if target not in charge_limit_options(car):
+                        raise BridgeError("This charge limit is no longer supported by the vehicle.")
+                    socket = client.websocket
+                    self.task = asyncio.create_task(self.run_socket())
+                    # Wait for this session's telemetry, never cached state.
+                    from .schedule import reported_limit
+                    while reported_limit(car) is None:
+                        self.check_session(socket)
+                        await asyncio.sleep(.25)
+                    if reported_limit(car) == target:
+                        return {"status": "already_set", "message": f"Vehicle reports {target}%; no change needed.",
+                                "confirmedAt": datetime.now(timezone.utc).isoformat()}
+                    client.sent_request = None
+                    baseline = car._last_message_received
+                    await client.set_charge_limit(vin, target)
+                    if not client.sent_request:
+                        raise BridgeError("The integration did not send the scheduled command.")
+                    sent_at = datetime.now(timezone.utc).isoformat()
+                    # Require a new telemetry update after sending, not just stale matching data.
+                    while reported_limit(car) != target or car._last_message_received == baseline:
+                        self.check_session(socket)
+                        await asyncio.sleep(.25)
+                    return {"status": "confirmed", "sentAt": sent_at,
+                            "confirmedAt": datetime.now(timezone.utc).isoformat(),
+                            "message": f"Car reports the requested {target}% limit."}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                socket = self.client.websocket if self.client else None
+                if getattr(exc, "status", None) == 429 or getattr(socket, "account_blocked", False):
+                    # A conservative safety pause, not a claim about Mercedes' recovery time.
+                    self.safety["cooldownUntil"] = max(time.time() + 86400, getattr(socket, "retry_after_until", 0), getattr(exc, "retry_after_until", 0))
+                    self.safety_store.save(self.safety)
+                    message = "Mercedes rate limited this session. No retries; further connections paused for at least 24 hours."
+                else:
+                    message = str(exc) if isinstance(exc, BridgeError) else "Could not confirm this change within its connection window. No retry will be made."
+                return {"status": "failed", "sentAt": sent_at, "message": message}
+            finally:
+                try:
+                    self.cache_vehicles()
+                    if self.client:
+                        self.last_diagnostics = self.client.websocket.diagnostics.snapshot()
+                finally:
+                    await self.stop()
+
+    def check_session(self, socket):
+        if socket.account_blocked:
+            raise BridgeError("Mercedes rate limited the connection.")
+        if socket.is_stopping or (self.task and self.task.done()):
+            raise BridgeError("The scheduled connection closed before vehicle confirmation.")
 
     async def connect(self, email, password, region):
+        if time.time() < self.cooldown_until():
+            raise BridgeError("Mercedes cooldown is active. Account login is paused too.")
         async with self.operation_lock:
             await self.stop()
             self.error = None
@@ -199,6 +287,13 @@ class Bridge:
                 async with asyncio.timeout(100):
                     await self.client.oauth.async_login_new(email, password)
                     await self.discover()
+                    self.cache_vehicles()
+                    await self.stop()
+            except MercedesRateLimitError as exc:
+                self.safety["cooldownUntil"] = max(time.time() + 86400, exc.retry_after_until)
+                self.safety_store.save(self.safety)
+                await self.stop()
+                raise BridgeError("Mercedes rate limited account setup. Connections are paused for at least 24 hours.") from None
             except MBAuth2FAError:
                 await self.stop()
                 raise BridgeError("This upstream login flow does not support accounts that require MFA. Use an eligible secondary vehicle account.") from None
@@ -218,7 +313,8 @@ class Bridge:
         client = self.client
         if not await client.oauth.async_get_cached_token():
             raise BridgeError("Your session expired. Reconnect your account.")
-        config, master = await asyncio.gather(client.webapi.get_config(), client.webapi.get_user_info())
+        config = await client.webapi.get_config()
+        master = await client.webapi.get_user_info()
         if not isinstance(master, dict):
             raise BridgeError("Mercedes did not return vehicle information.")
         vehicles = list(master.get("assignedVehicles") or [])
@@ -236,11 +332,8 @@ class Bridge:
             car.masterdata = item
             car.app_configuration = config or {}
             car.is_owner = item.get("isOwner", False)
-            responses = await asyncio.gather(
-                client.webapi.get_car_capabilities(vin), client.webapi.get_car_capabilities_commands(vin),
-                return_exceptions=True,
-            )
-            details, capabilities = responses
+            details = await client.webapi.get_car_capabilities(vin)
+            capabilities = await client.webapi.get_car_capabilities_commands(vin)
             if isinstance(details, dict):
                 car.features.update(details.get("features") or {})
                 car.vehicle_information = details.get("vehicle") or {}
@@ -251,7 +344,7 @@ class Bridge:
             client.cars[vin] = car
         if not client.cars:
             raise BridgeError("No vehicles were returned. Check that this account has access to your Mercedes.")
-        self.task = asyncio.create_task(self.run_socket())
+        # Socket sessions are opened only by scheduled_charge, never discovery.
 
     async def run_socket(self):
         async def on_ready():
@@ -267,18 +360,19 @@ class Bridge:
         client = self.client
         socket = client.websocket if client else None
         connected = bool(socket and socket._connection and not socket._connection.closed)
-        idle = bool(socket and not connected and getattr(socket, "is_stopping", False)
-                    and not getattr(socket, "_unloaded", False)
-                    and not getattr(socket, "account_blocked", False) and not self.error)
+        idle = not connected and not self.operation_lock.locked()
         return {
-            "configured": bool(client and client.cars), "connected": connected,
+            "configured": bool(self.cached.get("vehicles") and self.store.load().get("token")), "connected": connected,
             "intentionalIdle": idle,
-            "accountBlocked": bool(socket and getattr(socket, "account_blocked", False)),
+            "accountBlocked": time.time() < self.cooldown_until() or bool(socket and getattr(socket, "account_blocked", False)),
+            "cooldownUntil": datetime.fromtimestamp(self.cooldown_until(), timezone.utc).isoformat() if self.cooldown_until() else None,
+            "quietMode": True,
+            "sessionActive": self.runtime is not None,
             "connection": socket.connection_state if socket else "disconnected",
             "error": self.error or ("Reconnect required." if self.runtime and self.runtime.reload_requested else None),
-            "region": client._region if client else "Europe",
-            "connectionDiagnostics": socket.diagnostics.snapshot() if getattr(socket, "diagnostics", None) else None,
-            "vehicles": [serialize_car(car) for car in client.cars.values()] if client else [],
+            "region": client._region if client else self.cached.get("region", "Europe"),
+            "connectionDiagnostics": socket.diagnostics.snapshot() if getattr(socket, "diagnostics", None) else self.last_diagnostics,
+            "vehicles": [serialize_car(car) for car in client.cars.values()] if client else self.cached.get("vehicles", []),
         }
 
     async def command(self, vin, name, pin="", max_soc=None):
@@ -333,4 +427,6 @@ class Bridge:
             async with self.command_lock:
                 await self.stop()
                 self.store.clear()
+                self.vehicle_store.clear()
+                self.cached = {"vehicles": [], "region": "Europe"}
                 self.error = None

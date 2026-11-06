@@ -342,7 +342,7 @@ class Websocket:
         try:
             await self.async_stop()
         finally:
-            if self._unloaded:
+            if self._unloaded or getattr(self, "single_attempt", False):
                 self._LOGGER.debug("Skipping reconnect watchdog re-arm – instance unloaded")
             else:
                 # Wenn direkt ein Reconnect gewollt ist, hier starten:
@@ -364,6 +364,9 @@ class Websocket:
         """Send a message to the MB websocket servers."""
         if self._unloaded:
             return
+
+        if getattr(self, "single_attempt", False) and (self.is_stopping or not self._connection or self._connection.closed):
+            raise HomeAssistantError("Scheduled session is closed; no automatic reconnect.")
 
         if self.is_stopping and not car_command:
             return
@@ -461,6 +464,31 @@ class Websocket:
         self._LOGGER.debug("Queue handler stopped")
 
     async def _start_websocket_handler(self, session: ClientSession):
+        if getattr(self, "single_attempt", False):
+            # Scheduled one-shot session: never enter the vendored retry/relogin loop.
+            try:
+                await self._websocket_handler(session)
+            except WSServerHandshakeError as error:
+                self._connection_event("handshake_error", code=error.status)
+                self.account_blocked = error.status == 429
+                if self.account_blocked:
+                    from email.utils import parsedate_to_datetime
+                    value = (error.headers or {}).get("Retry-After", "")
+                    try:
+                        self.retry_after_until = time.time() + max(0, float(value))
+                    except ValueError:
+                        try:
+                            self.retry_after_until = parsedate_to_datetime(value).timestamp()
+                        except (ValueError, TypeError, OverflowError):
+                            self.retry_after_until = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._connection_event("network_error")
+            finally:
+                self.is_stopping = True
+                self.connection_state = "disconnected"
+            return
         self._LOGGER.debug(
             "_start_websocket_handler (is_stopping: %s, session.closed: %s)",
             self.is_stopping,
