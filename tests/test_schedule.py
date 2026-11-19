@@ -206,3 +206,54 @@ async def test_cannot_arm_a_night_inside_the_safety_cooldown(tmp_path):
         await scheduler.save(config(), now=BEFORE)
     await scheduler.save(config(date="2026-11-07"), now=BEFORE)
     bridge.scheduled_charge.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_failed_opt_in_keeps_saved_night_and_persists_evidence(tmp_path):
+    bridge=FakeBridge(tmp_path);bridge.operation_lock=asyncio.Lock()
+    bridge.test_charge=AsyncMock(return_value={'status':'failed','message':'Discovery failed','diagnostics':{'stage':'discovery'}})
+    scheduler=ChargeScheduler(bridge)
+    result=await scheduler.save_and_test(config(date='2099-11-06'))
+    assert result['config']['enabled'] and result['preflight']['status']=='failed'
+    assert all(j['status']=='scheduled' for j in result['jobs'])
+    restored=ChargeScheduler(bridge)
+    assert restored.preflight['diagnostics']['stage']=='discovery'
+    bridge.test_charge.assert_awaited_once_with(VIN)
+    bridge.scheduled_charge.assert_not_awaited()
+    restored.preflight={'status':'running'};restored.persist()
+    assert ChargeScheduler(bridge).preflight['status']=='interrupted'
+    assert bridge.test_charge.await_count==1
+
+@pytest.mark.asyncio
+async def test_http_requires_explicit_test_opt_in_and_limits_repeats(tmp_path, monkeypatch):
+    import server.app as app_module
+    bridge=FakeBridge(tmp_path);bridge.operation_lock=asyncio.Lock()
+    bridge.test_charge=AsyncMock(return_value={'status':'command_completed','message':'Mercedes reports command completed'})
+    monkeypatch.setattr(app_module,'Bridge',lambda directory:bridge)
+    http=TestClient(TestServer(app_module.create_app(data_dir=tmp_path,password='test-only')))
+    await http.start_server()
+    try:
+        payload=config(date='2099-11-06')
+        assert (await http.put('/api/schedule',json={**payload,'testConnection':True})).status==401
+        http.session.headers['Authorization']=BasicAuth('admin','test-only').encode()
+        assert (await http.put('/api/schedule',json=payload)).status==200
+        bridge.test_charge.assert_not_awaited()
+        assert (await http.put('/api/schedule',json={**payload,'testConnection':True},headers={'Origin':'https://untrusted.example'})).status==403
+        response=await http.put('/api/schedule',json={**payload,'testConnection':True})
+        assert response.status==200
+        result=await response.json()
+        assert result['preflight']['status']=='command_completed'
+        assert result['config']['enabled']
+        assert (await http.put('/api/schedule',json={**payload,'testConnection':True})).status==400
+        assert bridge.test_charge.await_count==1
+    finally:await http.close()
+
+@pytest.mark.asyncio
+async def test_opt_in_skips_when_scheduled_change_is_imminent(tmp_path):
+    from datetime import timedelta
+    bridge=FakeBridge(tmp_path);bridge.operation_lock=asyncio.Lock();bridge.test_charge=AsyncMock()
+    scheduler=ChargeScheduler(bridge)
+    next_minute=(datetime.now(LONDON)+timedelta(minutes=1)).replace(second=0,microsecond=0)
+    payload=config(date=next_minute.date().isoformat(),entries=[{'time':next_minute.strftime('%H:%M'),'maxSoc':80},{'time':(next_minute+timedelta(hours=1)).strftime('%H:%M'),'maxSoc':50}])
+    result=await scheduler.save_and_test(payload)
+    assert result['config']['enabled'] and result['preflight']['status']=='skipped'
+    bridge.test_charge.assert_not_awaited()

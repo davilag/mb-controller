@@ -227,6 +227,15 @@ class Bridge:
         return self.safety.get("cooldownUntil", 0)
 
     async def scheduled_charge(self, vin, target):
+        return await self._charge_session(vin, target)
+
+    async def test_charge(self, vin):
+        """Explicit opt-in: resend only the freshly reported current limit once."""
+        if self.operation_lock.locked() or self.command_lock.locked():
+            raise BridgeError("An operation is already in progress. Please wait.")
+        return await self._charge_session(vin, None, preflight=True)
+
+    async def _charge_session(self, vin, target, *, preflight=False):
         """One bounded connection session; no retry, relogin or background polling."""
         if time.time() < self.cooldown_until():
             raise BridgeError("Mercedes cooldown is active. This change was skipped without connecting.")
@@ -234,7 +243,7 @@ class Bridge:
             sent_at = None
             self.error = None
             started = time.monotonic()
-            evidence = {"version": 1, "stage": "account", "events": [], "lastLimit": None,
+            evidence = {"version": 1, "mode": "preflight" if preflight else "scheduled", "stage": "account", "events": [], "lastLimit": None,
                         "lastLimitAt": None, "failureCategory": None}
             car = None
             def record(event, **fields):
@@ -246,6 +255,7 @@ class Bridge:
                 # Only bounded protocol identifiers; never provider text, VINs or payloads.
                 safe = lambda v: str(v)[:80] if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", str(v)) else "unknown"
                 record("command_response", state=safe(state), code=safe(code) if code else None)
+                evidence["commandState"] = safe(state)
                 if code or str(state).upper() in {"FAILED", "REJECTED", "FAILURE", "ERROR"}:
                     evidence["failureCategory"] = "command_rejected"
             def reading():
@@ -268,7 +278,7 @@ class Bridge:
                     if vin not in client.cars:
                         raise BridgeError("Scheduled vehicle is no longer assigned to this account.")
                     car = client.cars[vin]
-                    if target not in charge_limit_options(car):
+                    if not preflight and target not in charge_limit_options(car):
                         raise BridgeError("This charge limit is no longer supported by the vehicle.")
                     socket = client.websocket
                     self.task = asyncio.create_task(self.run_socket())
@@ -278,8 +288,17 @@ class Bridge:
                         await asyncio.sleep(.25)
                     value, stamp = reading()
                     record("initial_limit", value=value, reportedAt=stamp, recent=recent(stamp))
+                    if preflight:
+                        evidence["stage"] = "fresh_test_limit"
+                        while not recent(reading()[1]):
+                            self.check_session(socket)
+                            await asyncio.sleep(.25)
+                        target = reading()[0]
+                        if target not in charge_limit_options(car):
+                            raise BridgeError("The reported limit cannot safely be resent. No test command was sent.")
+                        evidence["testLimit"] = target
                     # An old matching value is not proof that the car is already at target.
-                    if value == target:
+                    if not preflight and value == target:
                         evidence["stage"] = "fresh_matching_telemetry"
                         while not (reading()[0] == target and recent(reading()[1])):
                             self.check_session(socket)
@@ -306,16 +325,23 @@ class Bridge:
                         if (value == target and recent(stamp) and stamp >= sent_wall - 2
                                 and (baseline is None or stamp > baseline)):
                             break
+                        if preflight and evidence.get("commandState") == "FINISHED":
+                            record("test_command_completed")
+                            return {"status": "command_completed", "sentAt": sent_at,
+                                    "message": f"Mercedes reports the same-limit test command ({target}%) completed. No independent vehicle-state change was observed.", "diagnostics": evidence}
                         self.check_session(socket)
                         await asyncio.sleep(.25)
                     record("vehicle_confirmed", value=value, reportedAt=stamp)
                     return {"status": "confirmed", "sentAt": sent_at,
                             "confirmedAt": datetime.now(timezone.utc).isoformat(),
-                            "message": f"Car reports the requested {target}% limit with an updated timestamp.", "diagnostics": evidence}
+                            "message": (f"Test command confirmed with an updated {target}% vehicle reading." if preflight else f"Car reports the requested {target}% limit with an updated timestamp."), "diagnostics": evidence}
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if car is not None: reading()
+                if preflight and isinstance(exc, TimeoutError) and evidence.get("commandState") in {"ACKED_BY_APPTWIN", "ENQUEUED", "PROCESSING", "WAITING", "COMMAND_SENT", "WAKEUP_SENT", "WAITING_WAKEUP", "WAITING_SYNC"} and evidence["failureCategory"] is None:
+                    record("test_accepted_unconfirmed", state=evidence["commandState"])
+                    return {"status": "accepted", "sentAt": sent_at, "message": "Mercedes accepted the test command, but completion and vehicle confirmation were not observed. No retry was made.", "diagnostics": evidence}
                 from .connection_diagnostics import exception_evidence
                 evidence["causes"] = exception_evidence(exc)
                 evidence["discoveryStep"] = getattr(self, "discovery_step", None)

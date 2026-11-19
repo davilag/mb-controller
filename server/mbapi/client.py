@@ -1823,7 +1823,7 @@ class Client:
                 observer = getattr(self, "command_observer", None)
                 if observer:
                     for error in errors or [{}]:
-                        observer(request_id, command.get("state"), error.get("code"))
+                        observer(command.get("request_id"), command.get("state"), error.get("code"))
                 current_car.publish_updates()
 
     async def charge_program_configure(self, vin: str, program: int, max_soc: None | int = None) -> None:

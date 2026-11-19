@@ -103,7 +103,16 @@ def create_app(*, data_dir=None, password=None):
         return web.json_response(scheduler.snapshot())
 
     async def save_schedule(request):
-        return web.json_response(await scheduler.save(await request.json()))
+        data = await request.json()
+        test = data.get("testConnection", False)
+        if type(test) is not bool:
+            raise BridgeError("testConnection must be true or false.")
+        if scheduler.test_lock.locked():
+            raise BridgeError("A connection test is already in progress. Please wait.")
+        if test:
+            rate_limit(request, "schedule-test", 1, 300)
+            return web.json_response(await scheduler.save_and_test(data))
+        return web.json_response(await scheduler.save(data))
 
     async def disable_schedule(request):
         await scheduler.disable()

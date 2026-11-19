@@ -27,6 +27,7 @@ async def main():
         'schedule': {'config': {'mode': 'oneNight', 'enabled': False, 'vin': '', 'date': '2099-11-06',
             'entries': [{'time': '23:30', 'maxSoc': 80}, {'time': '05:30', 'maxSoc': 50}]},
             'timezone': 'Europe/London', 'status': 'disabled', 'message': 'Quiet. No night scheduled.', 'jobs': [], 'nextChangeAt': None}}
+    submitted_tests = []
     async with async_playwright() as p:
         engine = os.environ.get("MB_UI_ENGINE", "chromium")
         browser = await getattr(p, engine).launch(**({"executable_path": os.environ["MB_UI_CHROMIUM"]} if engine == "chromium" and os.environ.get("MB_UI_CHROMIUM") else {}))
@@ -37,10 +38,13 @@ async def main():
             path = route.request.url.split('/api')[1]
             if path == '/schedule' and route.request.method == 'PUT':
                 config = route.request.post_data_json
+                submitted_tests.append(config.get('testConnection', False))
                 state['schedule'] = {'config': config, 'timezone': 'Europe/London', 'status': 'waiting',
                     'message': 'Armed for one night. Quiet until the first change.', 'jobs': [
                         {'at': config['date']+'T23:30:00Z', 'target': 80, 'status': 'scheduled', 'message': 'Waiting for its scheduled time.', 'sentAt': None, 'confirmedAt': None},
                         {'at': '2099-11-07T05:30:00Z', 'target': 50, 'status': 'scheduled', 'message': 'Waiting for its scheduled time.', 'sentAt': None, 'confirmedAt': None}], 'nextChangeAt': config['date']+'T23:30:00Z'}
+                if config.get('testConnection'):
+                    state['schedule']['preflight'] = {'status': 'command_completed', 'message': 'Mercedes reports the same-limit test command completed. No independent vehicle-state change was observed.'}
             if path == '/schedule' and route.request.method == 'DELETE':
                 state['schedule']['config']['enabled'] = False
                 state['schedule']['status'] = 'disabled'
@@ -78,6 +82,11 @@ async def main():
         await page.get_by_role('button', name='Schedule this night').click()
         await page.get_by_text('Night armed', exact=True).wait_for()
         assert state['schedule']['config']['mode'] == 'oneNight'
+        assert submitted_tests == [False]
+        await page.get_by_role('button', name='Schedule & test connection').click()
+        await page.get_by_text('Mercedes reports the same-limit test command completed.', exact=False).wait_for()
+        assert submitted_tests == [False, True]
+        await page.screenshot(path=str(artifacts/f'{engine}-preflight-390.png'), full_page=True)
         await page.screenshot(path=str(artifacts/f'{engine}-armed-390.png'), full_page=True)
         await page.get_by_role('button', name='Cancel night').click()
         await page.get_by_text('Not armed', exact=True).wait_for()

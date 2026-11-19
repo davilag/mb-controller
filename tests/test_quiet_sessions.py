@@ -258,8 +258,8 @@ def test_batched_command_responses_deliver_each_request(monkeypatch):
     client.command_observer = Mock()
     payload = {'apptwin_command_status_updates_by_vin': {'updates_by_vin': {VIN: {
         'vin': VIN, 'updates_by_pid': {
-            'unrelated': {'state': 'FINISHED'},
-            'our-request': {'state': 'FAILED', 'errors': [{'code': 'VEHICLE_OFFLINE', 'message':'private provider text'}]}
+            'unrelated': {'request_id':'unrelated-request', 'state': 'FINISHED'},
+            'process-123': {'request_id':'our-request', 'state': 'FAILED', 'errors': [{'code': 'VEHICLE_OFFLINE', 'message':'private provider text'}]}
         }}}}}
     monkeypatch.setattr(module, 'MessageToJson', lambda *a, **k: json.dumps(payload))
     client._process_apptwin_command_status_updates_by_vin(None)
@@ -305,3 +305,53 @@ async def test_discovery_http_status_preserved_without_provider_body(tmp_path, m
             assert 'SECRET_TOKEN' not in caplog.text
         finally:
             await bridge.stop()
+
+@pytest.mark.asyncio
+async def test_opt_in_sends_same_limit_and_distinguishes_completion(tmp_path, monkeypatch):
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch, initial=50,
+        response=('our-request','FINISHED',None))
+    result = await bridge.test_charge(VIN)
+    assert commands == [50]  # Never substitutes either scheduled target.
+    assert result['status'] == 'command_completed'
+    assert result['diagnostics']['testLimit'] == 50
+    assert not result.get('confirmedAt')
+    assert bridge.client is None and bridge.task is None
+
+@pytest.mark.asyncio
+async def test_opt_in_acknowledgement_is_not_vehicle_confirmation(tmp_path, monkeypatch):
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch, initial=50,
+        response=('our-request','ACKED_BY_APPTWIN',None))
+    result = await bridge.test_charge(VIN)
+    assert commands == [50]
+    assert result['status'] == 'accepted' and not result.get('confirmedAt')
+    assert bridge.client is None
+
+@pytest.mark.asyncio
+async def test_opt_in_no_response_remains_unconfirmed(tmp_path, monkeypatch):
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch, initial=50)
+    result = await bridge.test_charge(VIN)
+    assert commands == [50] and result['status'] == 'failed'
+    assert result['diagnostics']['failureCategory']=='timeout'
+
+@pytest.mark.asyncio
+async def test_opt_in_stale_data_never_sends(tmp_path, monkeypatch):
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch, initial=50, stamp=time.time()-86400)
+    result = await bridge.test_charge(VIN)
+    assert commands == [] and result['status']=='failed'
+    assert result['sentAt'] is None
+    assert result['diagnostics']['stage']=='fresh_test_limit'
+
+@pytest.mark.asyncio
+async def test_same_limit_keeps_reported_charging_program():
+    from server.bridge import LocalClient
+    car=Car(VIN);car.features={'CHARGE_PROGRAM_CONFIGURE':True}
+    car.capabilities={'commands':[{'commandName':'CHARGE_PROGRAM_CONFIGURE','parameters':[{'parameterName':'MAX_SOC'}]}]}
+    car.electric=Electric();car.electric.selectedChargeProgram=CarAttribute(2,'VALID',time.time())
+    client=object.__new__(LocalClient);client.cars={VIN:car}
+    client.charge_program_configure=AsyncMock()
+    await client.set_charge_limit(VIN,50)
+    client.charge_program_configure.assert_awaited_once_with(VIN,2,50)
+    car.electric.selectedChargeProgram.retrievalstatus='INVALID'
+    with pytest.raises(BridgeError,match='active charging program'):
+        await client.set_charge_limit(VIN,50)
+    assert client.charge_program_configure.await_count==1

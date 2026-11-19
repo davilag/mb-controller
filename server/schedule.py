@@ -91,6 +91,8 @@ class ChargeScheduler:
         self.config = {"mode": "oneNight", "enabled": False, "vin": "",
                        "date": datetime.now(self.zone).date().isoformat(), "entries": deepcopy(DEFAULT_ENTRIES)}
         self.jobs = []
+        self.preflight = None
+        self.test_lock = asyncio.Lock()
         self.status, self.message = "disabled", "Quiet. No night scheduled."
         self.lock = asyncio.Lock()
         self.wake = asyncio.Event()
@@ -103,6 +105,9 @@ class ChargeScheduler:
                 if (len(jobs) != 2 and (self.config["enabled"] or jobs)) or any(j["at"] != e["at"] or j["target"] != e["target"] or j["status"] not in TERMINAL | {"scheduled", "running"} for j, e in zip(jobs, expected)):
                     raise ValueError("Invalid saved jobs")
                 self.jobs = jobs
+                self.preflight = stored.get("preflight")
+                if self.preflight and self.preflight.get("status") == "running":
+                    self.preflight.update(status="interrupted", message="Server restarted during the test. It will not be replayed.")
                 for job in self.jobs:
                     if job["status"] == "running":
                         job.update(status="interrupted", message="Server restarted during this change. It will not be replayed; check the official app.")
@@ -116,7 +121,7 @@ class ChargeScheduler:
             self.status, self.message = "error", "Saved schedule could not be read. No connections will be made."
 
     def persist(self):
-        self.store.save({"version": 2, "config": self.config, "jobs": self.jobs})
+        self.store.save({"version": 2, "config": self.config, "jobs": self.jobs, "preflight": self.preflight})
 
     def refresh_status(self):
         if not self.config["enabled"]:
@@ -139,7 +144,7 @@ class ChargeScheduler:
         pending = next((j for j in self.jobs if j["status"] == "scheduled"), None) if self.config["enabled"] else None
         latest = next((j for j in reversed(self.jobs) if j["status"] != "scheduled"), None)
         return {"config": deepcopy(self.config), "timezone": self.zone.key, "status": self.status,
-                "message": self.message, "jobs": deepcopy(self.jobs),
+                "message": self.message, "jobs": deepcopy(self.jobs), "preflight": deepcopy(self.preflight),
                 "target": latest["target"] if latest else None,
                 "nextChangeAt": pending["at"] if pending else None,
                 "nextTarget": pending["target"] if pending else None,
@@ -167,9 +172,38 @@ class ChargeScheduler:
             # Atomic save first; failures leave the previous night untouched.
             self.store.save({"version": 2, "config": config, "jobs": jobs if config["enabled"] else []})
             self.config, self.jobs = config, jobs if config["enabled"] else []
+            self.preflight = None
             self.refresh_status()
             self.wake.set()
         return self.snapshot()
+
+    async def save_and_test(self, data):
+        if self.test_lock.locked() or self.bridge.operation_lock.locked():
+            raise BridgeError("An operation is already in progress. Please wait.")
+        if data.get("enabled") is not True:
+            raise BridgeError("Save an enabled night before testing its connection.")
+        async with self.test_lock:
+            await self.save(data)
+            selected = self.config
+            self.preflight = {"status": "running", "at": datetime.now(timezone.utc).isoformat(), "message": "Schedule saved. Testing the current charge limit once."}
+            if (datetime.fromisoformat(self.jobs[0]["at"]) - datetime.now(timezone.utc)).total_seconds() < 90:
+                self.preflight.update(status="skipped", message="Schedule saved. Connection test skipped because a scheduled change is due within 90 seconds.")
+                self.persist()
+                return self.snapshot()
+            self.persist()  # Never replay a test after restart or a lost HTTP response.
+            try:
+                result = await self.bridge.test_charge(selected["vin"])
+            except asyncio.CancelledError:
+                if self.config is selected:
+                    self.preflight.update(status="interrupted", message="Test interrupted. It will not be replayed. Check the official app.")
+                    self.persist()
+                raise
+            except Exception as exc:
+                result = {"status": "failed", "message": str(exc) if isinstance(exc, BridgeError) else "Connection test failed. Schedule remains saved; no retry was made."}
+            if self.config is selected:
+                self.preflight.update(result)
+                self.persist()
+            return self.snapshot()
 
     async def disable(self):
         async with self.lock:
@@ -178,7 +212,7 @@ class ChargeScheduler:
             for job in jobs:
                 if job["status"] == "scheduled":
                     job.update(status="cancelled", message="Cancelled. No connection made.")
-            self.store.save({"version": 2, "config": config, "jobs": jobs})
+            self.store.save({"version": 2, "config": config, "jobs": jobs, "preflight": self.preflight})
             self.config, self.jobs = config, jobs
             self.status, self.message = "disabled", "Night cancelled. Quiet; no further connections scheduled."
             self.wake.set()
