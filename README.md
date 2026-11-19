@@ -239,3 +239,11 @@ a saved schedule or sent command alone is not confirmation.
 The UI distinguishes intentional idle from rate limiting. Operational monitors
 should not treat routine protective idle as an outage; failures, rate limiting,
 and unconfirmed schedule application still require attention.
+
+### Scheduled-attempt evidence
+
+Each completed attempt retains bounded diagnostics in encrypted `schedule.enc`, exposed through the authenticated schedule/state API and Attempt details in the UI. Evidence includes execution stage, safe exception class/category, sent timestamp, last reported limit and its provider timestamp, and command responses correlated by request ID. Raw provider errors, credentials, VINs and payloads are not written to attempt logs. Mercedes command acknowledgement is not vehicle confirmation.
+
+A matching initial limit must carry a provider timestamp no older than 120 seconds (up to 5 seconds clock skew), otherwise the one-shot session waits for recent data without sending a redundant command. After a command, confirmation requires a matching limit with an advancing attribute timestamp at or after sending (2-second timestamp precision tolerance). Merely receiving another WebSocket message is insufficient. Missing/old timestamps remain unconfirmed; this conservative threshold may report uncertainty for unchanged values that Mercedes does not timestamp again.
+
+The existing 65-second overall deadline, two dated slots, no automatic retry/reconnect and quiet startup/read behavior are unchanged. A timeout is not evidence that Mercedes rejected or failed to apply the command. Last night's historical records cannot be reconstructed by deploying this change.

@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, timezone
 import time
+import logging
+import re
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,23 @@ from .mbapi.client import Client
 from .mbapi.errors import MBAuth2FAError, MBAuthError, MBLegalTermsError, MercedesRateLimitError
 from .mbapi.proto import client_pb2
 from .runtime import ConfigEntry, HomeAssistant, TokenStore, async_get_clientsession
+
+
+ATTEMPT_LOG = logging.getLogger("mb.attempt")
+SESSION_SECONDS = 65
+FRESH_SECONDS = 120
+
+def limit_reading(car):
+    from .schedule import reported_limit
+    value = reported_limit(car)
+    attribute = next((getattr(car.electric, name, None) for name in ("max_soc", "maxSoc")
+                      if getattr(getattr(car.electric, name, None), "retrievalstatus", None) == "VALID"), None)
+    try:
+        stamp = float(attribute.timestamp)
+        if stamp > 100000000000: stamp /= 1000
+    except (TypeError, ValueError, AttributeError):
+        stamp = None
+    return value, stamp
 
 
 class BridgeError(Exception):
@@ -46,6 +65,7 @@ class LocalClient(Client):
             raise BridgeError("Mercedes has rate limited this account. Commands are paused.")
         if getattr(self.websocket, "single_attempt", False) and not (self.websocket._connection and not self.websocket._connection.closed):
             raise BridgeError("The scheduled connection closed. No automatic retry will be made.")
+        self.pending_request = message.commandRequest.request_id
         await super().execute_car_command(message)
         self.sent_request = message.commandRequest.request_id
 
@@ -213,15 +233,38 @@ class Bridge:
         async with self.operation_lock:
             sent_at = None
             self.error = None
+            started = time.monotonic()
+            evidence = {"version": 1, "stage": "account", "events": [], "lastLimit": None,
+                        "lastLimitAt": None, "failureCategory": None}
+            car = None
+            def record(event, **fields):
+                item = {"at": datetime.now(timezone.utc).isoformat(), "event": event, **fields}
+                evidence["events"] = (evidence["events"] + [item])[-30:]
+                ATTEMPT_LOG.warning("Scheduled charge: %s", item)
+            def observe(request_id, state, code):
+                if request_id not in {getattr(self.client, "sent_request", None), getattr(self.client, "pending_request", None)}: return
+                # Only bounded protocol identifiers; never provider text, VINs or payloads.
+                safe = lambda v: str(v)[:80] if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", str(v)) else "unknown"
+                record("command_response", state=safe(state), code=safe(code) if code else None)
+                if code or str(state).upper() in {"FAILED", "REJECTED", "FAILURE", "ERROR"}:
+                    evidence["failureCategory"] = "command_rejected"
+            def reading():
+                value, stamp = limit_reading(car)
+                evidence.update(lastLimit=value, lastLimitAt=stamp)
+                return value, stamp
+            def recent(stamp):
+                return stamp is not None and -5 <= time.time() - stamp <= FRESH_SECONDS
             try:
-                async with asyncio.timeout(65):
+                async with asyncio.timeout(SESSION_SECONDS):
                     data = self.store.load()
                     if not data.get("token"):
                         raise BridgeError("Account setup is required before scheduling.")
                     await self.create_client(data)
                     self.client.websocket.single_attempt = True
+                    evidence["stage"] = "discovery"
                     await self.discover()
                     client = self.client
+                    client.command_observer = observe
                     if vin not in client.cars:
                         raise BridgeError("Scheduled vehicle is no longer assigned to this account.")
                     car = client.cars[vin]
@@ -229,39 +272,68 @@ class Bridge:
                         raise BridgeError("This charge limit is no longer supported by the vehicle.")
                     socket = client.websocket
                     self.task = asyncio.create_task(self.run_socket())
-                    # Wait for this session's telemetry, never cached state.
-                    from .schedule import reported_limit
-                    while reported_limit(car) is None:
+                    evidence["stage"] = "initial_telemetry"
+                    while reading()[0] is None:
                         self.check_session(socket)
                         await asyncio.sleep(.25)
-                    if reported_limit(car) == target:
-                        return {"status": "already_set", "message": f"Vehicle reports {target}%; no change needed.",
-                                "confirmedAt": datetime.now(timezone.utc).isoformat()}
+                    value, stamp = reading()
+                    record("initial_limit", value=value, reportedAt=stamp, recent=recent(stamp))
+                    # An old matching value is not proof that the car is already at target.
+                    if value == target:
+                        evidence["stage"] = "fresh_matching_telemetry"
+                        while not (reading()[0] == target and recent(reading()[1])):
+                            self.check_session(socket)
+                            if reading()[0] != target: break
+                            await asyncio.sleep(.25)
+                        if reading()[0] == target and recent(reading()[1]):
+                            record("already_at_target")
+                            return {"status": "already_set", "message": f"Recent vehicle data reports {target}%; no change needed.",
+                                    "confirmedAt": datetime.now(timezone.utc).isoformat(), "diagnostics": evidence}
                     client.sent_request = None
-                    baseline = car._last_message_received
+                    baseline = reading()[1]
+                    evidence["stage"] = "send"
+                    sent_wall = time.time()
                     await client.set_charge_limit(vin, target)
                     if not client.sent_request:
                         raise BridgeError("The integration did not send the scheduled command.")
                     sent_at = datetime.now(timezone.utc).isoformat()
-                    # Require a new telemetry update after sending, not just stale matching data.
-                    while reported_limit(car) != target or car._last_message_received == baseline:
+                    record("command_sent", target=target)
+                    evidence["stage"] = "confirmation"
+                    while True:
+                        if evidence["failureCategory"] == "command_rejected":
+                            raise BridgeError("Mercedes rejected the charge-limit command. See the saved response code. No retry will be made.")
+                        value, stamp = reading()
+                        if (value == target and recent(stamp) and stamp >= sent_wall - 2
+                                and (baseline is None or stamp > baseline)):
+                            break
                         self.check_session(socket)
                         await asyncio.sleep(.25)
+                    record("vehicle_confirmed", value=value, reportedAt=stamp)
                     return {"status": "confirmed", "sentAt": sent_at,
                             "confirmedAt": datetime.now(timezone.utc).isoformat(),
-                            "message": f"Car reports the requested {target}% limit."}
+                            "message": f"Car reports the requested {target}% limit with an updated timestamp.", "diagnostics": evidence}
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if car is not None: reading()
+                evidence["exceptionType"] = type(exc).__name__
+                evidence["elapsedSeconds"] = round(time.monotonic() - started, 2)
                 socket = self.client.websocket if self.client else None
                 if getattr(exc, "status", None) == 429 or getattr(socket, "account_blocked", False):
+                    evidence["failureCategory"] = "rate_limited"
                     # A conservative safety pause, not a claim about Mercedes' recovery time.
                     self.safety["cooldownUntil"] = max(self.cooldown_until(), getattr(socket, "retry_after_until", 0), getattr(exc, "retry_after_until", 0))
                     self.safety_store.save(self.safety)
                     message = "Mercedes rate limited this session. No automatic retry will be made." + (" Further connections are paused until its Retry-After expires." if self.cooldown_until() > time.time() else " No cooldown duration was supplied.")
                 else:
-                    message = str(exc) if isinstance(exc, BridgeError) else "Could not confirm this change within its connection window. No retry will be made."
-                return {"status": "failed", "sentAt": sent_at, "message": message}
+                    evidence["failureCategory"] = evidence["failureCategory"] or ("timeout" if isinstance(exc, TimeoutError) else "session_closed" if isinstance(exc, BridgeError) else "unexpected_error")
+                    stale = evidence["lastLimitAt"] is not None and not recent(evidence["lastLimitAt"])
+                    if isinstance(exc, TimeoutError):
+                        message = ("Only stale vehicle data was received" if stale else "The connection window ended") + f" during {evidence['stage'].replace('_', ' ')}. " + ("Command was sent, but vehicle application is unconfirmed. " if sent_at else "No command was sent. ") + "No retry will be made."
+                    else:
+                        message = str(exc) if isinstance(exc, BridgeError) else f"This change failed during {evidence['stage']} ({type(exc).__name__}). No retry will be made."
+                record("attempt_failed", stage=evidence["stage"], category=evidence["failureCategory"], exceptionType=type(exc).__name__, lastLimit=evidence["lastLimit"], reportedAt=evidence["lastLimitAt"])
+                return {"status": "failed", "sentAt": sent_at, "message": message, "diagnostics": evidence}
             finally:
                 try:
                     self.cache_vehicles()

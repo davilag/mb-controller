@@ -1808,41 +1808,23 @@ class Client:
 
         self._write_debug_output(data, "acr")
 
-        if apptwin_json["apptwin_command_status_updates_by_vin"]:
-            if apptwin_json["apptwin_command_status_updates_by_vin"]["updates_by_vin"]:
-                car = list(apptwin_json["apptwin_command_status_updates_by_vin"]["updates_by_vin"].keys())[0]
-                car = apptwin_json["apptwin_command_status_updates_by_vin"]["updates_by_vin"][car]
-                vin = car.get("vin", None)
-                if vin:
-                    if car["updates_by_pid"]:
-                        command = list(car["updates_by_pid"].keys())[0]
-                        command = car["updates_by_pid"][command]
-                        if command:
-                            command_type = command.get("type")
-                            command_state = command.get("state")
-                            command_error_code = ""
-                            command_error_message = ""
-                            if command.get("errors"):
-                                for err in command["errors"]:
-                                    command_error_code = err.get("code")
-                                    command_error_message = err.get("message")
-                                    LOGGER.warning(
-                                        "Car action: %s failed. error_code: %s, error_message: %s",
-                                        command_type,
-                                        command_error_code,
-                                        command_error_message,
-                                    )
-
-                            current_car = self.cars.get(vin)
-
-                            if current_car:
-                                current_car.last_command_type = command_type
-                                current_car.last_command_state = command_state
-                                current_car.last_command_error_code = command_error_code
-                                current_car.last_command_error_message = command_error_message
-                                current_car.last_command_time_stamp = command.get("timestamp_in_ms", 0)
-
-                                current_car.publish_updates()
+        updates = apptwin_json.get("apptwin_command_status_updates_by_vin", {}).get("updates_by_vin", {})
+        for update in updates.values():
+            current_car = self.cars.get(update.get("vin"))
+            if current_car is None:
+                continue
+            for request_id, command in (update.get("updates_by_pid") or {}).items():
+                errors = command.get("errors") or []
+                current_car.last_command_type = command.get("type")
+                current_car.last_command_state = command.get("state")
+                current_car.last_command_error_code = errors[-1].get("code", "") if errors else ""
+                current_car.last_command_error_message = errors[-1].get("message", "") if errors else ""
+                current_car.last_command_time_stamp = command.get("timestamp_in_ms", 0)
+                observer = getattr(self, "command_observer", None)
+                if observer:
+                    for error in errors or [{}]:
+                        observer(request_id, command.get("state"), error.get("code"))
+                current_car.publish_updates()
 
     async def charge_program_configure(self, vin: str, program: int, max_soc: None | int = None) -> None:
         """Send the selected charge program to the car."""
