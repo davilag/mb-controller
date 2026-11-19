@@ -58,12 +58,14 @@ class WebApi:
         kwargs.setdefault("headers", {})
         kwargs.setdefault("proxy", SYSTEM_PROXY)
 
+        self.last_request = {"phase": "token"}
         token = await self._oauth.async_get_cached_token()
 
         if not self._session or self._session.closed:
             self._session = async_get_clientsession(self.hass, VERIFY_SSL)
 
         if not rcp_headers:
+            self.last_request["phase"] = "app_version"
             await self._app_version.async_refresh(self._session)
             kwargs["headers"] = {
                 "Authorization": f"Bearer {token['access_token']}",
@@ -83,33 +85,23 @@ class WebApi:
             }
 
         try:
+            self.last_request["phase"] = "http"
             if "url" in kwargs:
                 async with self._session.request(method, **kwargs) as resp:
+                    self.last_request["status"] = resp.status
                     if resp.status == 429:
                         raise MercedesRateLimitError(resp.headers.get("Retry-After", ""))
-                    # resp.raise_for_status()
+                    resp.raise_for_status()
                     if return_as_json:
                         return await resp.json(content_type=None)
 
                     return await resp.read()
             else:
                 async with self._session.request(method, url, **kwargs) as resp:
+                    self.last_request["status"] = resp.status
                     if resp.status == 429:
                         raise MercedesRateLimitError(resp.headers.get("Retry-After", ""))
-                    if 400 <= resp.status < 500:
-                        try:
-                            error = await resp.text()
-                            error_json = json.loads(error)
-                            if error_json:
-                                error_message = f"Error requesting: {url} - {resp.status} -  {error_json['code']} - {error_json['errors']}"
-                            else:
-                                error_message = f"Error requesting: {url} - {resp.status} - 0 - {error}"
-                        except (json.JSONDecodeError, KeyError):
-                            error_message = f"Error requesting: {url} - {resp.status} - 0 - {error}"
-
-                        LOGGER.error(error_message) if not ignore_errors else LOGGER.info(error_message)
-                    else:
-                        resp.raise_for_status()
+                    resp.raise_for_status()
 
                     if return_as_json:
                         return await resp.json(content_type=None)
@@ -119,16 +111,15 @@ class WebApi:
         except MercedesRateLimitError:
             raise
         except ClientError as err:
-            LOGGER.debug(traceback.format_exc())
             if not ignore_errors:
-                raise ClientError from err
+                raise
 
             return []
-        except Exception:  # noqa: BLE001 - deliberate catch-all: this parses arbitrary
-            # API responses, so an unexpected TypeError/KeyError from a
-            # malformed payload degrades to a None return rather than tearing
-            # down setup. Kept broad for that reason.
-            LOGGER.debug(traceback.format_exc())
+        except Exception:
+            # Preserve parse/transport causes without logging URLs, bodies or tokens.
+            if not ignore_errors:
+                raise
+            return []
 
     async def get_config(self):
         """Get standard user information."""

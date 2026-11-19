@@ -316,6 +316,11 @@ class Bridge:
                 raise
             except Exception as exc:
                 if car is not None: reading()
+                from .connection_diagnostics import exception_evidence
+                evidence["causes"] = exception_evidence(exc)
+                evidence["discoveryStep"] = getattr(self, "discovery_step", None)
+                evidence["request"] = getattr(getattr(self.client, "webapi", None), "last_request", None)
+                http_status = next((c["status"] for c in evidence["causes"] if c.get("status")), None)
                 evidence["exceptionType"] = type(exc).__name__
                 evidence["elapsedSeconds"] = round(time.monotonic() - started, 2)
                 socket = self.client.websocket if self.client else None
@@ -327,12 +332,16 @@ class Bridge:
                     message = "Mercedes rate limited this session. No automatic retry will be made." + (" Further connections are paused until its Retry-After expires." if self.cooldown_until() > time.time() else " No cooldown duration was supplied.")
                 else:
                     evidence["failureCategory"] = evidence["failureCategory"] or ("timeout" if isinstance(exc, TimeoutError) else "session_closed" if isinstance(exc, BridgeError) else "unexpected_error")
+                    if http_status:
+                        evidence["failureCategory"] = "authorization" if http_status in (401, 403) else "http_error"
+                    elif any(c["type"].startswith(("ClientConnector", "ClientSSLError", "ServerDisconnected")) or "errno" in c for c in evidence["causes"]):
+                        evidence["failureCategory"] = "network_error"
                     stale = evidence["lastLimitAt"] is not None and not recent(evidence["lastLimitAt"])
                     if isinstance(exc, TimeoutError):
                         message = ("Only stale vehicle data was received" if stale else "The connection window ended") + f" during {evidence['stage'].replace('_', ' ')}. " + ("Command was sent, but vehicle application is unconfirmed. " if sent_at else "No command was sent. ") + "No retry will be made."
                     else:
-                        message = str(exc) if isinstance(exc, BridgeError) else f"This change failed during {evidence['stage']} ({type(exc).__name__}). No retry will be made."
-                record("attempt_failed", stage=evidence["stage"], category=evidence["failureCategory"], exceptionType=type(exc).__name__, lastLimit=evidence["lastLimit"], reportedAt=evidence["lastLimitAt"])
+                        message = str(exc) if isinstance(exc, BridgeError) else f"This change failed during {evidence['stage']} / {evidence['discoveryStep'] or 'unknown step'} ({type(exc).__name__}{', HTTP ' + str(http_status) if http_status else ''}). No retry will be made."
+                record("attempt_failed", stage=evidence["stage"], category=evidence["failureCategory"], exceptionType=type(exc).__name__, causes=evidence["causes"], discoveryStep=evidence["discoveryStep"], request=evidence["request"], lastLimit=evidence["lastLimit"], reportedAt=evidence["lastLimitAt"])
                 return {"status": "failed", "sentAt": sent_at, "message": message, "diagnostics": evidence}
             finally:
                 try:
@@ -383,14 +392,18 @@ class Bridge:
 
     async def discover(self):
         client = self.client
+        self.discovery_step = "token"
         if not await client.oauth.async_get_cached_token():
             raise BridgeError("Your session expired. Reconnect your account.")
+        self.discovery_step = "config"
         config = await client.webapi.get_config()
+        self.discovery_step = "user_info"
         master = await client.webapi.get_user_info()
         if not isinstance(master, dict):
             raise BridgeError("Mercedes did not return vehicle information.")
         vehicles = list(master.get("assignedVehicles") or [])
         for fleet in master.get("fleets") or []:
+            self.discovery_step = "fleet_info"
             info = await client.webapi.get_fleet_info(fleet.get("companyId"), fleet.get("fleetId"))
             vehicles.extend((info or {}).get("bookedVehicles") or [])
         for item in vehicles:
@@ -404,7 +417,9 @@ class Bridge:
             car.masterdata = item
             car.app_configuration = config or {}
             car.is_owner = item.get("isOwner", False)
+            self.discovery_step = "vehicle_capabilities"
             details = await client.webapi.get_car_capabilities(vin)
+            self.discovery_step = "command_capabilities"
             capabilities = await client.webapi.get_car_capabilities_commands(vin)
             if isinstance(details, dict):
                 car.features.update(details.get("features") or {})

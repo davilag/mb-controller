@@ -44,3 +44,18 @@ class ConnectionDiagnostics:
     def snapshot(self):
         return {'events': list(self.events), 'messagesReceived': self.messages,
                 'lastConnectedAt': self.last_connected, 'lastMessageAt': self.last_message}
+
+
+def exception_evidence(error):
+    """Extract bounded structural facts, never exception messages or request objects."""
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen and len(chain) < 8:
+        seen.add(id(error))
+        item = {"type": type(error).__name__}
+        for field in ("status", "errno"):
+            value = getattr(error, field, None)
+            if type(value) is int:
+                item[field] = value
+        chain.append(item)
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    return chain

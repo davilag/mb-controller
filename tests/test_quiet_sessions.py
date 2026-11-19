@@ -265,3 +265,43 @@ def test_batched_command_responses_deliver_each_request(monkeypatch):
     client._process_apptwin_command_status_updates_by_vin(None)
     client.command_observer.assert_any_call('our-request', 'FAILED', 'VEHICLE_OFFLINE')
     assert client.command_observer.call_count == 2
+
+
+def test_exception_chain_has_only_structural_facts():
+    import json
+    from server.connection_diagnostics import exception_evidence
+    inner = OSError(111, 'SECRET_HOST_AND_TOKEN')
+    outer = aiohttp.ClientError('SECRET_URL')
+    outer.__cause__ = inner
+    assert exception_evidence(outer) == [{'type':'ClientError'},{'type':'ConnectionRefusedError','errno':111}]
+    assert 'SECRET' not in json.dumps(exception_evidence(outer))
+    inner.__cause__ = outer
+    assert len(exception_evidence(outer)) == 2
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [401, 403, 503])
+async def test_discovery_http_status_preserved_without_provider_body(tmp_path, monkeypatch, status, caplog):
+    from server.mbapi import webapi
+    count = 0
+    async def rejected(request):
+        nonlocal count
+        count += 1
+        return web.Response(status=status, text='SECRET_PROVIDER_BODY')
+    app=web.Application();app.router.add_get('/v1/config', rejected)
+    async with TestServer(app) as server:
+        bridge=Bridge(tmp_path)
+        await bridge.create_client({'region':'Europe'})
+        client=bridge.client
+        monkeypatch.setattr(webapi.helper,'Rest_url',lambda region: str(server.make_url('')).rstrip('/'))
+        client.oauth.async_get_cached_token=AsyncMock(return_value={'access_token':'SECRET_TOKEN'})
+        client.webapi._app_version.async_refresh=AsyncMock()
+        try:
+            with pytest.raises(aiohttp.ClientResponseError) as caught:
+                await client.webapi.get_config()
+            assert caught.value.status==status
+            assert client.webapi.last_request=={'phase':'http','status':status}
+            assert count==1
+            assert 'SECRET_PROVIDER_BODY' not in caplog.text
+            assert 'SECRET_TOKEN' not in caplog.text
+        finally:
+            await bridge.stop()
