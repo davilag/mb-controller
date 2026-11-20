@@ -7,7 +7,7 @@ export type ChargeSchedule = { config: ScheduleConfig; timezone: string; status:
 const defaults = [{ time: '23:30', maxSoc: 80 }, { time: '05:30', maxSoc: 50 }];
 function today(zone: string) { return new Intl.DateTimeFormat('en-CA', {timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date()); }
 function localDate(value: string) { const [y, m, d] = value.split('-').map(Number); return new Date(y, m - 1, d, 12); }
-const labels: Record<string, string> = { scheduled: 'Scheduled', running: 'Connecting', confirmed: 'Confirmed by car', already_set: 'Already at target', failed: 'Not confirmed', missed: 'Missed', interrupted: 'Interrupted', cancelled: 'Cancelled' };
+const labels: Record<string, string> = { scheduled: 'Scheduled', running: 'Connecting', confirmed: 'Confirmed by car', already_set: 'Already at target', command_completed: 'Completed · state unverified', accepted: 'Accepted · unconfirmed', failed: 'Not confirmed', missed: 'Missed', interrupted: 'Interrupted', cancelled: 'Cancelled' };
 
 export function ScheduleControl({ vin, options, schedule, busy, onSave, onDisable }: {
   vin: string; options: number[]; schedule?: ChargeSchedule; busy: boolean;

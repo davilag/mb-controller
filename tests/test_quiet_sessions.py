@@ -168,7 +168,7 @@ async def test_short_provider_retry_after_is_not_extended_to_a_day(tmp_path):
     remaining = Bridge(tmp_path).cooldown_until() - time.time()
     assert 590 < remaining <= 600
 
-async def attempt_fixture(tmp_path, monkeypatch, *, initial=50, stamp=None, response=None, update=None):
+async def attempt_fixture(tmp_path, monkeypatch, *, initial=50, stamp=None, response=None, update=None, close_after_send=False):
     import server.bridge as module
     monkeypatch.setattr(module, 'SESSION_SECONDS', .4)
     bridge = Bridge(tmp_path)
@@ -185,6 +185,8 @@ async def attempt_fixture(tmp_path, monkeypatch, *, initial=50, stamp=None, resp
                 bridge.client.command_observer(*response)
             if update:
                 update(car)
+            if close_after_send:
+                bridge.client.websocket.is_stopping = True
         bridge.client.set_charge_limit = command
     async def socket():
         bridge.client.websocket._connection = SimpleNamespace(closed=False, close=AsyncMock())
@@ -198,9 +200,9 @@ async def attempt_fixture(tmp_path, monkeypatch, *, initial=50, stamp=None, resp
 async def test_stale_matching_value_is_not_already_set(tmp_path, monkeypatch):
     bridge, commands = await attempt_fixture(tmp_path, monkeypatch, initial=80, stamp=time.time()-86400)
     result = await bridge.scheduled_charge(VIN, 80)
-    assert commands == []
-    assert result['status'] == 'failed' and result['sentAt'] is None
-    assert result['diagnostics']['stage'] == 'fresh_matching_telemetry'
+    assert commands == [80]
+    assert result['status'] == 'failed' and result['sentAt']
+    assert result['diagnostics']['stage'] == 'confirmation'
     assert result['diagnostics']['failureCategory'] == 'timeout'
     assert 'stale' in result['message']
     assert bridge.client is None
@@ -210,7 +212,8 @@ async def test_acknowledged_command_without_new_limit_is_not_confirmed(tmp_path,
     bridge, commands = await attempt_fixture(tmp_path, monkeypatch, response=('our-request','FINISHED',None))
     result = await bridge.scheduled_charge(VIN, 80)
     assert commands == [80] and result['sentAt']
-    assert result['status'] == 'failed'
+    assert result['status'] == 'command_completed'
+    assert not result.get('confirmedAt')
     assert result['diagnostics']['stage'] == 'confirmation'
     assert any(e['event']=='command_response' for e in result['diagnostics']['events'])
 
@@ -355,3 +358,85 @@ async def test_same_limit_keeps_reported_charging_program():
     with pytest.raises(BridgeError,match='active charging program'):
         await client.set_charge_limit(VIN,50)
     assert client.charge_program_configure.await_count==1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,expected", [("FINISHED", "command_completed"), ("ACKED_BY_APPTWIN", "accepted")])
+async def test_idle_close_preserves_correlated_command_outcome(tmp_path, monkeypatch, state, expected):
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch,
+        response=('our-request', state, None), close_after_send=True)
+    result = await bridge.scheduled_charge(VIN, 80)
+    assert commands == [80] and result['status'] == expected
+    assert not result.get('confirmedAt')
+    assert bridge.client is None and bridge.task is None
+
+@pytest.mark.asyncio
+async def test_finished_still_waits_for_independent_fresh_confirmation(tmp_path, monkeypatch):
+    def update(car):
+        car.electric.max_soc = CarAttribute(80, 'VALID', time.time()+.01)
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch,
+        response=('our-request','FINISHED',None), update=update)
+    result = await bridge.scheduled_charge(VIN, 80)
+    assert result['status'] == 'confirmed' and result['confirmedAt']
+    assert commands == [80]
+
+@pytest.mark.asyncio
+async def test_rejection_overrides_finished_without_retry(tmp_path, monkeypatch):
+    bridge, commands = await attempt_fixture(tmp_path, monkeypatch,
+        response=('our-request','FINISHED',None))
+    original = bridge.discover
+    async def discover():
+        await original()
+        send = bridge.client.set_charge_limit
+        async def rejected(vin, target):
+            await send(vin,target)
+            bridge.client.command_observer('our-request','FAILED','RIS_COULD_NOT_SEND_COMMAND')
+        bridge.client.set_charge_limit = rejected
+    bridge.discover = discover
+    result = await bridge.scheduled_charge(VIN,80)
+    assert result['status'] == 'failed'
+    assert result['diagnostics']['failureCategory'] == 'command_rejected'
+    assert commands == [80]
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status,kind', [(400,'MBAuthError'), (401,'MBAuthError'), (403,'MBAuthError'), (404,'MBAuthTemporaryError'), (500,'MBAuthTemporaryError'), (503,'MBAuthTemporaryError'), (429,'MercedesRateLimitError')])
+async def test_upgraded_oauth_error_classification_is_safe(tmp_path, status, kind, caplog):
+    bridge = Bridge(tmp_path)
+    await bridge.create_client({'region':'Europe'})
+    oauth = bridge.client.oauth
+    response = Mock(status=status, headers={'Retry-After':'60'})
+    response.text = AsyncMock(return_value='SECRET_PROVIDER_BODY')
+    context = Mock(__aenter__=AsyncMock(return_value=response), __aexit__=AsyncMock(return_value=False))
+    oauth._session = Mock(closed=False, request=Mock(return_value=context))
+    try:
+        with pytest.raises(Exception) as caught:
+            await oauth._async_request('POST','https://example.invalid/token')
+        assert type(caught.value).__name__ == kind
+        assert caught.value.status == status
+        assert 'SECRET_PROVIDER_BODY' not in str(caught.value) + caplog.text
+        assert oauth._session.request.call_count == 1
+        response.text.assert_not_awaited()
+    finally:
+        oauth._session = None
+        await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_upgraded_climate_adapter_supports_old_and_new_head_units():
+    from server.bridge import LocalClient
+    from server.mbapi.proto import vehicle_commands_pb2 as commands
+    client = object.__new__(LocalClient)
+    client.config_entry = SimpleNamespace(options={})
+    car = Car(VIN); car.features = {}; car.vehicle_information = {'headUnitType':'NTG6'}
+    client.cars = {VIN:car}
+    client.preheat_start_departure_time = AsyncMock()
+    client.preheat_start = AsyncMock()
+    client.preheat_stop = AsyncMock()
+    await client.preheat_start_universal(VIN)
+    call = client.preheat_start_departure_time.call_args.args
+    assert call[0] == VIN and 0 <= call[1] < 1440
+    car.vehicle_information['headUnitType'] = 'NTG7'
+    await client.preheat_start_universal(VIN)
+    client.preheat_start.assert_awaited_once_with(VIN)
+    await client.preheat_stop_universal(VIN)
+    client.preheat_stop.assert_awaited_once_with(VIN,commands.ZEVPreconditioningType.now)

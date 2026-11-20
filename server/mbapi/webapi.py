@@ -16,6 +16,7 @@ import google.protobuf.message
 from server.mbapi.app_version import AppVersionManager
 
 from .const import REGION_CHINA, RIS_OS_VERSION, SYSTEM_PROXY, VERIFY_SSL, WEBSOCKET_USER_AGENT, WEBSOCKET_USER_AGENT_CN
+from .errors import MBAuthError
 from .helper import UrlHelper as helper
 from .oauth import Oauth
 from .errors import MercedesRateLimitError
@@ -60,6 +61,8 @@ class WebApi:
 
         self.last_request = {"phase": "token"}
         token = await self._oauth.async_get_cached_token()
+        if token is None:
+            raise MBAuthError("No valid token available - reauth required")
 
         if not self._session or self._session.closed:
             self._session = async_get_clientsession(self.hass, VERIFY_SSL)
@@ -196,6 +199,9 @@ class WebApi:
     async def is_car_rcp_supported(self, vin: str, **kwargs):
         """Return if is car rcp supported."""
         token = await self._oauth.async_get_cached_token()
+        if token is None:
+            raise MBAuthError("No valid token available - reauth required")
+
         headers = {
             "Authorization": f"Bearer {token['access_token']}",
             "User-Agent": WEBSOCKET_USER_AGENT if self._region != REGION_CHINA else WEBSOCKET_USER_AGENT_CN,

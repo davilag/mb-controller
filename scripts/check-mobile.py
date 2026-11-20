@@ -91,6 +91,17 @@ async def main():
         await page.get_by_role('button', name='Cancel night').click()
         await page.get_by_text('Not armed', exact=True).wait_for()
         assert not state['schedule']['config']['enabled']
+        # New terminal outcomes must be readable, not raw machine statuses or confirmed.
+        state['schedule']['jobs'] = [
+            {'at':'2099-11-06T23:30:00Z','target':80,'status':'command_completed', 'sentAt':'2099-11-06T23:30:01Z','confirmedAt':None, 'message':'Mercedes reports completed. Vehicle state remains unverified.'},
+            {'at':'2099-11-07T05:30:00Z','target':50,'status':'accepted', 'sentAt':'2099-11-07T05:30:01Z','confirmedAt':None, 'message':'Accepted, completion and vehicle confirmation not observed.'}]
+        state['schedule']['status'] = 'unverified'
+        for width in [320,390,768,1280]:
+            await page.set_viewport_size({'width':width,'height':844})
+            await page.reload()
+            await page.get_by_text('Completed · state unverified',exact=True).wait_for()
+            await page.get_by_text('Accepted · unconfirmed',exact=True).wait_for()
+            assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
         # Long safety warning and full result list must also fit a narrow screen.
         state['accountBlocked'] = True; state['cooldownUntil'] = '2099-11-07T16:10:00Z'
         await page.set_viewport_size({'width': 320, 'height': 844}); await page.reload()

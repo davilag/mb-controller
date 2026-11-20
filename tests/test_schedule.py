@@ -257,3 +257,22 @@ async def test_opt_in_skips_when_scheduled_change_is_imminent(tmp_path):
     result=await scheduler.save_and_test(payload)
     assert result['config']['enabled'] and result['preflight']['status']=='skipped'
     bridge.test_charge.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['command_completed','accepted'])
+async def test_unverified_command_outcomes_persist_and_never_replay(tmp_path, outcome):
+    bridge = FakeBridge(tmp_path)
+    bridge.scheduled_charge.return_value = {'status':outcome, 'sentAt':'2026-11-06T23:30:01+00:00', 'message':'Vehicle state unverified.'}
+    scheduler = ChargeScheduler(bridge)
+    await scheduler.save(config(), now=BEFORE)
+    await scheduler.tick(now=instant('2026-11-06T23:30Z'))
+    assert scheduler.status == 'unverified'
+    restarted = ChargeScheduler(bridge)
+    assert restarted.jobs[0]['status'] == outcome
+    await restarted.tick(now=instant('2026-11-07T05:30Z'))
+    assert restarted.status == 'unverified' and not restarted.config['enabled']
+    again = ChargeScheduler(bridge)
+    await again.tick(now=instant('2026-11-07T05:30:10Z'))
+    assert bridge.scheduled_charge.await_count == 2
+    assert all(not job.get('confirmedAt') for job in again.jobs)

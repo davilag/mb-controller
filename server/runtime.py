@@ -147,5 +147,6 @@ def parse_datetime(value):
 system_info = SimpleNamespace(async_get_system_info=get_system_info)
 dt_util = SimpleNamespace(
     parse_datetime=parse_datetime,
+    now=lambda: datetime.now(ZoneInfo(os.environ.get("TZ", "Europe/London"))),
     DEFAULT_TIME_ZONE=ZoneInfo(os.environ.get("TZ", "Europe/London")),
 )

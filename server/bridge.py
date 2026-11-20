@@ -43,7 +43,7 @@ COMMANDS = {
     "lock": ("Lock doors", "doors_lock", "DOORS_LOCK"),
     "unlock": ("Unlock doors", "doors_unlock_with_pin", "DOORS_UNLOCK"),
     "climate_start": ("Start climate", "preheat_start_universal", "ZEV_PRECONDITIONING_START"),
-    "climate_stop": ("Stop climate", "preheat_stop", "ZEV_PRECONDITIONING_STOP"),
+    "climate_stop": ("Stop climate", "preheat_stop_universal", "ZEV_PRECONDITIONING_STOP"),
     "auxheat_start": ("Start auxiliary heating", "auxheat_start", "AUXHEAT_START"),
     "auxheat_stop": ("Stop auxiliary heating", "auxheat_stop", "AUXHEAT_STOP"),
     "flash": ("Flash lights", "sigpos_start", "SIGPOS_START"),
@@ -256,6 +256,8 @@ class Bridge:
                 safe = lambda v: str(v)[:80] if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", str(v)) else "unknown"
                 record("command_response", state=safe(state), code=safe(code) if code else None)
                 evidence["commandState"] = safe(state)
+                if str(state).upper() == "FINISHED" and not code:
+                    evidence["commandCompleted"] = True
                 if code or str(state).upper() in {"FAILED", "REJECTED", "FAILURE", "ERROR"}:
                     evidence["failureCategory"] = "command_rejected"
             def reading():
@@ -297,17 +299,13 @@ class Bridge:
                         if target not in charge_limit_options(car):
                             raise BridgeError("The reported limit cannot safely be resent. No test command was sent.")
                         evidence["testLimit"] = target
-                    # An old matching value is not proof that the car is already at target.
-                    if not preflight and value == target:
-                        evidence["stage"] = "fresh_matching_telemetry"
-                        while not (reading()[0] == target and recent(reading()[1])):
-                            self.check_session(socket)
-                            if reading()[0] != target: break
-                            await asyncio.sleep(.25)
-                        if reading()[0] == target and recent(reading()[1]):
-                            record("already_at_target")
-                            return {"status": "already_set", "message": f"Recent vehicle data reports {target}%; no change needed.",
-                                    "confirmedAt": datetime.now(timezone.utc).isoformat(), "diagnostics": evidence}
+                    # Fresh matching data can avoid a command. Stale matching
+                    # data cannot: send the requested target once, rather than
+                    # waiting for unsolicited telemetry until upstream idles out.
+                    if not preflight and value == target and recent(stamp):
+                        record("already_at_target")
+                        return {"status": "already_set", "message": f"Recent vehicle data reports {target}%; no change needed.",
+                                "confirmedAt": datetime.now(timezone.utc).isoformat(), "diagnostics": evidence}
                     client.sent_request = None
                     baseline = reading()[1]
                     evidence["stage"] = "send"
@@ -339,9 +337,19 @@ class Bridge:
                 raise
             except Exception as exc:
                 if car is not None: reading()
-                if preflight and isinstance(exc, TimeoutError) and evidence.get("commandState") in {"ACKED_BY_APPTWIN", "ENQUEUED", "PROCESSING", "WAITING", "COMMAND_SENT", "WAKEUP_SENT", "WAITING_WAKEUP", "WAITING_SYNC"} and evidence["failureCategory"] is None:
-                    record("test_accepted_unconfirmed", state=evidence["commandState"])
-                    return {"status": "accepted", "sentAt": sent_at, "message": "Mercedes accepted the test command, but completion and vehicle confirmation were not observed. No retry was made.", "diagnostics": evidence}
+                # A completed command is not a rejected command, even when
+                # telemetry is stale or the intentional idle watchdog closes.
+                # Keep waiting for independent telemetry until the session ends.
+                ended = isinstance(exc, TimeoutError) or (isinstance(exc, BridgeError) and "connection closed" in str(exc))
+                if sent_at and ended and evidence["failureCategory"] is None:
+                    if evidence.get("commandCompleted"):
+                        record("command_completed_unverified")
+                        return {"status": "command_completed", "sentAt": sent_at,
+                                "message": f"Mercedes reports the {target}% command completed. Vehicle state remains unverified; no fresh matching reading arrived. No retry was made.", "diagnostics": evidence}
+                    if evidence.get("commandState") in {"ACKED_BY_APPTWIN", "ENQUEUED", "PROCESSING", "WAITING", "COMMAND_SENT", "WAKEUP_SENT", "WAITING_WAKEUP", "WAITING_SYNC", "INITIATION"}:
+                        record("command_accepted_unconfirmed", state=evidence["commandState"])
+                        return {"status": "accepted", "sentAt": sent_at,
+                                "message": "Mercedes accepted the command, but completion and vehicle confirmation were not observed. No retry was made.", "diagnostics": evidence}
                 from .connection_diagnostics import exception_evidence
                 evidence["causes"] = exception_evidence(exc)
                 evidence["discoveryStep"] = getattr(self, "discovery_step", None)

@@ -14,7 +14,7 @@ from .bridge import BridgeError
 from .runtime import TokenStore
 
 DEFAULT_ENTRIES = [{"time": "23:30", "maxSoc": 80}, {"time": "05:30", "maxSoc": 50}]
-TERMINAL = {"confirmed", "already_set", "failed", "missed", "interrupted", "cancelled"}
+TERMINAL = {"command_completed", "accepted", "confirmed", "already_set", "failed", "missed", "interrupted", "cancelled"}
 
 
 def normalize_config(data):
@@ -128,8 +128,8 @@ class ChargeScheduler:
             if self.jobs and any(j["status"] == "cancelled" for j in self.jobs) and not any(j["status"] in {"failed", "missed", "interrupted"} for j in self.jobs):
                 self.status, self.message = "disabled", "Night cancelled. Quiet; no further connections scheduled."
             elif self.jobs and all(j["status"] in TERMINAL for j in self.jobs):
-                self.status = "completed" if all(j["status"] in {"confirmed", "already_set"} for j in self.jobs) else "error"
-                self.message = "Night finished. No more connections are scheduled." if self.status == "completed" else "Night ended with an unconfirmed change. No more connections are scheduled."
+                self.status = "completed" if all(j["status"] in {"confirmed", "already_set"} for j in self.jobs) else "unverified" if not any(j["status"] in {"failed", "missed", "interrupted"} for j in self.jobs) else "error"
+                self.message = "Night finished. No more connections are scheduled." if self.status == "completed" else "Night ended with an unverified change. See each result below. No more connections are scheduled."
             else:
                 self.status, self.message = "disabled", "Quiet. No night scheduled."
             return
@@ -137,7 +137,7 @@ class ChargeScheduler:
             self.config["enabled"] = False
             return self.refresh_status()
         latest = next((j for j in reversed(self.jobs) if j["status"] != "scheduled"), None)
-        self.status = "active" if latest and latest["status"] in {"confirmed", "already_set"} else "error" if latest and latest["status"] in {"failed", "missed", "interrupted"} else "waiting"
+        self.status = "active" if latest and latest["status"] in {"confirmed", "already_set"} else "unverified" if latest and latest["status"] in {"command_completed", "accepted"} else "error" if latest and latest["status"] in {"failed", "missed", "interrupted"} else "waiting"
         self.message = latest["message"] if latest else "Armed for one night. Quiet until the first change."
 
     def snapshot(self, now=None):

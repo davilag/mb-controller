@@ -1,7 +1,7 @@
 # Upstream protocol implementation
 
 This POC adapts the MIT-licensed [ReneNulschDE/mbapi2020](https://github.com/ReneNulschDE/mbapi2020)
-at commit `8b5b75c4b0a6593047c2b2dd984f1f713b09ff0e` (manifest version 0.43.0).
+at commit `3eae55854ac62fe3dd21474a1578658d9c3e3468` (manifest version 0.44.0).
 Original copyright and license are retained in `server/mbapi/LICENSE`.
 
 `server/mbapi/` contains the upstream protocol client, OAuth, REST/WebSocket handling,
@@ -18,3 +18,5 @@ builders, but only the explicit allowlist in `bridge.py` is reachable through th
 
 This is an unofficial integration of a private cloud API. Mercedes can change authentication
 or vehicle endpoints independently of this project.
+
+Upgraded to release v0.44.0 on 2026-11-20. Home Assistant-only entity/service setup is not bundled; standalone adapters retain those responsibilities. Local rate-limit guards, bounded sessions and sanitized error evidence are retained.

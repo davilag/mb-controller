@@ -26,3 +26,5 @@ main{max-width:850px}.intro{margin-bottom:28px}.intro h1{font-size:48px}.night-d
   .night-date input{width:100%}
   .toolbar{flex-direction:row;align-items:center}
 }
+
+.job-summary{flex-wrap:wrap}.job-state.command_completed,.job-state.accepted{color:var(--muted);white-space:normal}

@@ -22,7 +22,7 @@ import aiohttp
 from aiohttp import ClientSession
 
 from server.mbapi.app_version import AppVersionManager
-from server.mbapi.errors import MBAuth2FAError, MBAuthError, MBLegalTermsError
+from server.mbapi.errors import MBAuth2FAError, MBAuthError, MBAuthTemporaryError, MBLegalTermsError
 
 from .const import (
     DEFAULT_COUNTRY_CODE,
@@ -41,6 +41,7 @@ from .helper import LogHelper, UrlHelper as helper
 
 _LOGGER = logging.getLogger(__name__)
 
+AUTH_REJECTED_CODES = (400, 401, 403)
 GATEWAY_ERROR_CODES = (502, 503, 504)
 LOGIN_MAX_ATTEMPTS = 3
 LOGIN_RETRY_BACKOFF_SECONDS = 5
@@ -610,18 +611,12 @@ class Oauth:
         async with self._session.request(method, url, data=data, **kwargs) as resp:
             if resp.status == 429:
                 raise MercedesRateLimitError(resp.headers.get("Retry-After", ""))
-            if 400 <= resp.status <= 500:
-                try:
-                    error = await resp.text()
-                    error_json = json.loads(error)
-                    if error_json:
-                        error_message = f"Error requesting: {url} - {error_json['code']} - {error_json['errors']}"
-                    else:
-                        error_message = f"Error requesting: {url} - 0 - {error}"
-                except (json.JSONDecodeError, KeyError):
-                    error_message = f"Error requesting: {url} - 0 - {error}"
-
-                _LOGGER.error(error_message)
-                raise MBAuthError(error_message)
+            if resp.status >= 400:
+                # Preserve upstream permanent/temporary classification, without
+                # logging or retaining provider bodies, URLs or credentials.
+                error = MBAuthError if resp.status in AUTH_REJECTED_CODES else MBAuthTemporaryError
+                exc = error(f"Mercedes token endpoint returned HTTP {resp.status}.")
+                exc.status = resp.status
+                raise exc
 
             return await resp.json(content_type=None)
